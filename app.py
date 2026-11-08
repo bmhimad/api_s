@@ -213,7 +213,7 @@ def build_proposal_payload(session_token, stable_id, variant_id, amount, currenc
                 "destinationChanged": True,
             }], "noDeliveryRequired": [], "useProgressiveRates": False, "supportsSplitShipping": True},
             "deliveryExpectations": {"deliveryExpectationLines": []},
-            "merchandise": {"merchandiseLines": [{
+            "merchandise": {"lines": [{
                 "stableId": stable_id,
                 "merchandise": {"productVariantReference": {
                     "id": f"gid://shopify/ProductVariantMerchandise/{variant_id}",
@@ -341,7 +341,7 @@ def attempt_checkout(session, shop_url, ccn, mm, yyyy, cvv, ua, prop_id_default,
                     "destinationChanged": False,
                 }], "noDeliveryRequired": [], "useProgressiveRates": False, "supportsSplitShipping": True},
                 "deliveryExpectations": {"deliveryExpectationLines":[{"signedHandle":h} for h in signed_handles]},
-                "merchandise": {"merchandiseLines":[{
+                "merchandise": {"lines":[{
                     "stableId": stable_id,
                     "merchandise": {"productVariantReference": {
                         "id": f"gid://shopify/ProductVariantMerchandise/{variant_id}",
