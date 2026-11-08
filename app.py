@@ -7,6 +7,7 @@ import uuid
 import time
 import json
 import urllib3
+from urllib.parse import quote
 from flask import Flask, request, jsonify
 from curl_cffi import requests
 
