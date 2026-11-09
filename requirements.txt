@@ -2,3 +2,5 @@ Flask
 gunicorn
 curl_cffi
 urllib3
+curl_cffi>=0.7
+uvloop; sys_platform != "win32"
