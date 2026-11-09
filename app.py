@@ -1,20 +1,17 @@
 """
-app.py — Shopify Checkout Node (Render / scale plan)
-
-All fixes applied:
-  • BUDGET_SEC = 40 (freeze fix)
-  • Code alias in _resp / _resp_poll / _resp_submit (for run.py display)
+app.py — Shopify Checkout Node
+All fixes:
+  • BUDGET_SEC = 30
+  • Code alias in all response helpers
   • NO_RECEIPT bug fixed (rss fallback to session_token)
   • Full PollForReceipt raw body always returned
-  • 3DS_REQUIRED, not ORDER_PLACED (approved=False on ActionRequiredReceipt)
+  • 3DS_REQUIRED not ORDER_PLACED (approved=False on ActionRequiredReceipt)
   • CAPTCHA_REQUIRED explicit classification
-  • Cookie warm-up (Step 0) — establishes _shopify_y / _shopify_s / _secure_session_id
-  • Full sec-ch-ua headers on every GraphQL call
-  • Human jitter between steps
-  • Strict 25s poll window + per-request budget cap
-  • One shop per check (_USED_SHOPS dedup, recycles only when exhausted)
+  • Cookie warm-up (skips 2nd GET if slow)
+  • Submit tax retries 3 → 2, submit timeout 10s → 6s
+  • Strict 25s poll window
+  • One shop per check (_USED_SHOPS dedup)
   • _release_shop() on cart timeout only
-  • /sites exposes shops_used_this_cycle / cap_warning
 """
 import os
 import re
@@ -38,7 +35,7 @@ app = Flask(__name__)
 # ⚙️ ENV & CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 WORKERS_CAP = int(os.environ.get("WORKERS_CAP", "20"))
-BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "40"))   # was 60 → 40 (freeze fix)
+BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "30"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -754,7 +751,7 @@ def _run_check(card_str, proxy_str):
 
     try:
         # ═══════════════════════════════════════════════════════════════
-        # Step 0: Cookie warm-up
+        # Step 0: Cookie warm-up (skip 2nd GET if first is slow)
         # ═══════════════════════════════════════════════════════════════
         try:
             warm_hdr = {
@@ -770,12 +767,17 @@ def _run_check(card_str, proxy_str):
                 "upgrade-insecure-requests": "1",
             }
             log("  Step 0: Warm-up (homepage cookies)")
+            t_warm = time.monotonic()
             session.get(shop_url + "/", headers=warm_hdr,
-                        timeout=t_max(8), allow_redirects=True)
-            time.sleep(random.uniform(0.4, 1.0))
-            session.get(shop_url + "/", headers=warm_hdr,
-                        timeout=t_max(8), allow_redirects=True)
-            time.sleep(random.uniform(0.3, 0.7))
+                        timeout=t_max(6), allow_redirects=True)
+            first_ms = (time.monotonic() - t_warm) * 1000
+            if first_ms < 3000:
+                time.sleep(random.uniform(0.4, 0.9))
+                session.get(shop_url + "/", headers=warm_hdr,
+                            timeout=t_max(6), allow_redirects=True)
+            else:
+                log(f"  Step 0: 1st GET took {first_ms:.0f}ms — skipping 2nd warm-up")
+            time.sleep(random.uniform(0.2, 0.5))
         except Exception as e:
             log(f"  Step 0: Warm-up EXC (non-fatal) -> {str(e)[:80]}")
 
@@ -1083,12 +1085,12 @@ def _run_check(card_str, proxy_str):
         cur_tot = amount_f
 
         log("  Step 6: Submitting Order")
-        for tax_attempt in range(3):
+        for tax_attempt in range(2):                # 3 → 2 (fewer retries)
             try:
                 r_submit = session.post(
                     f"{shop_url}/checkouts/internal/graphql/persisted?operationName=SubmitForCompletion",
                     json=_build_submit(cur_tax, cur_tot), headers=hdr,
-                    timeout=t_max(10),
+                    timeout=t_max(6),               # 10 → 6
                 )
                 body = r_submit.text
             except Exception as e:
