@@ -1,5 +1,6 @@
 """
 app.py — Shopify Checkout Node (Render / scale plan)
+Fixed for 100% Digital Products (No Shipping)
 """
 import os
 import re
@@ -116,10 +117,6 @@ ADDRESSES = [
     {"street":"100 W 10th St",            "city":"Wilmington","state":"DE","zip":"19801","phone":"+13025550100"},
     {"street":"500 5th Ave",              "city":"New York",  "state":"NY","zip":"10110","phone":"+12125550100"},
     {"street":"200 W Madison St",         "city":"Chicago",   "state":"IL","zip":"60606","phone":"+13125550100"},
-    {"street":"600 Congress Ave",         "city":"Austin",    "state":"TX","zip":"78701","phone":"+15125550100"},
-    {"street":"1 Market St",              "city":"San Francisco","state":"CA","zip":"94105","phone":"+14155550100"},
-    {"street":"300 S Biscayne Blvd",      "city":"Miami",     "state":"FL","zip":"33131","phone":"+13055550100"},
-    {"street":"100 Peachtree St",         "city":"Atlanta",   "state":"GA","zip":"30303","phone":"+14045550100"},
 ]
 
 def _identity():
@@ -180,34 +177,6 @@ def _receipt_session(b):
 def _code(b):
     m = re.search(r'"code"\s*:\s*"([^"]+)"', b); return m.group(1) if m else ""
 
-def _signed_handles(b):
-    try:
-        d = json.loads(b)
-        sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
-               .get("result",{}).get("sellerProposal",{}))
-        de = sp.get("deliveryExpectations",{})
-        if de.get("__typename") == "FilledDeliveryExpectationTerms":
-            return [x["signedHandle"] for x in de.get("deliveryExpectations",[]) if x.get("signedHandle")]
-    except Exception: pass
-    return []
-
-def _delivery_handle(b):
-    try:
-        d = json.loads(b)
-        sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
-               .get("result",{}).get("sellerProposal",{}))
-        sds = sp.get("selectedDeliveryStrategy",{})
-        if isinstance(sds, dict) and sds.get("handle"): return sds["handle"]
-        for dg in sp.get("deliveryGroups",[]):
-            for opt in dg.get("deliveryOptions",[]):
-                if isinstance(opt, dict) and opt.get("handle"): return opt["handle"]
-    except Exception: pass
-    for pat in (r'"selectedDeliveryStrategy"\s*:\s*\{[^{}]*"handle"\s*:\s*"([^"]+)"',
-                r'"__typename"\s*:\s*"CompleteDeliveryStrategy"[^{}]*"handle"\s*:\s*"([^"]+)"'):
-        m = re.search(pat, b)
-        if m: return m.group(1)
-    return ""
-
 def _checkout_total(b):
     m = re.search(r'"checkoutTotal"\s*:\s*\{\s*"value"\s*:\s*\{\s*"amount"\s*:\s*"([^"]+)"', b)
     return m.group(1) if m else ""
@@ -218,7 +187,6 @@ def _tax_amount(b):
         sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
                .get("result",{}).get("sellerProposal",{}))
         
-        # Look for V2 first (DevTools response), then fallback
         v2 = sp.get("tax",{}).get("totalTaxAmountV2",{}).get("amount")
         if v2: return v2
         
@@ -245,14 +213,6 @@ def _total_from_rejected(b):
             if v: return v
     except Exception: pass
     return ""
-
-def _is_shipping_required(b):
-    try:
-        d = json.loads(b)
-        sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
-               .get("result",{}).get("sellerProposal",{}))
-        return sp.get("isShippingRequired", True)
-    except Exception: return True
 
 def _payment_method_id(b):
     try:
@@ -350,9 +310,10 @@ def _graphql_ids(session, shop_url, checkout_html, ua, t_rem):
         return None, None, None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🛒 PAYLOAD BUILDER
+# 🛒 PAYLOAD BUILDER (Strictly Digital)
 # ─────────────────────────────────────────────────────────────────────────────
 def _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, proposal_id, use_lines=False):
+    # We only need address for the final Proposal 3, but for digital it's ignored
     if addr:
         sa   = _street_addr(addr["fn"], addr["ln"], addr)
         dest = {"partialStreetAddress": {"address1":sa["address1"],"city":sa["city"],
@@ -381,7 +342,7 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
                         "options": {},
                     },
                     "targetMerchandiseLines": {"any": True},
-                    "deliveryMethodTypes":    ["SHIPPING"],
+                    "deliveryMethodTypes":    ["NONE"], # FIXED: Digital only
                     "expectedTotalPrice":     {"any": True},
                     "destinationChanged":     True,
                 }],
