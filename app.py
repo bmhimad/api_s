@@ -531,7 +531,7 @@ def _classify_failed(code):
     return (c or "CARD_DECLINED"), False, False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🧠 PIPELINE (Strict Flow + Polling with Detailed Logs)
+# 🧠 PIPELINE (Strict Flow + Polling)
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_check(card_str, proxy_str):
     t_start = time.monotonic()
@@ -615,6 +615,10 @@ def _run_check(card_str, proxy_str):
             "user-agent":                   ua,
             "x-checkout-one-session-token": session_token,
             "x-checkout-web-build-id":      commit_sha,
+            "x-checkout-web-deploy-stage":  "production",
+            "x-checkout-web-server-handling": "fast",
+            "x-checkout-web-server-rendering": "yes",
+            "x-checkout-web-source-id":     cart_token,
         }
         prop_url = f"{shop_url}/checkouts/internal/graphql/persisted?operationName=Proposal"
         
@@ -892,7 +896,7 @@ def _run_check(card_str, proxy_str):
         elapsed_ms = (time.monotonic() - t_start) * 1000
         log(f"  Step 6: Submit Response -> {body[:150]}")
 
-        # ═══ NEW POLLING LOGIC ═══
+        # ═══ NEW POLLING LOGIC (POST + JSON) ═══
         rid = _receipt_id(body)
         rss = _receipt_session(body)
 
@@ -904,21 +908,40 @@ def _run_check(card_str, proxy_str):
                     break
                 time.sleep(0.5)
                 try:
-                    params = {"operationName":"PollForReceipt",
-                              "variables": json.dumps({"receiptId": rid, "sessionToken": rss}),
-                              "id": poll_id}
-                    r_p = session.get(f"{shop_url}/checkouts/internal/graphql/persisted?{urlencode(params)}",
-                                      headers=hdr, timeout=t_max(3))
+                    poll_params = {'operationName': 'PollForReceipt'}
+                    poll_payload = {
+                        'variables': {
+                            'receiptId': rid,
+                            'sessionToken': rss
+                        },
+                        'operationName': 'PollForReceipt',
+                        'id': poll_id
+                    }
+                    r_p = session.post(f"{shop_url}/checkouts/internal/graphql/persisted",
+                                       params=poll_params,
+                                       headers=hdr,
+                                       json=poll_payload,
+                                       timeout=t_max(3))
                     pb = r_p.text
                     
-                    log(f"    Poll {poll_num}: {pb[:150]}")
+                    log(f"    Poll {poll_num}: Status {r_p.status_code} -> {pb[:150]}")
                     
-                    if "FailedReceipt" in pb:
-                        code = _code(pb)
-                        log(f"    Poll {poll_num}: FAILED -> {code}")
-                        resp, apv, chg = _classify_failed(code)
-                        ms = (time.monotonic() - t_start) * 1000
-                        return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
+                    if "FailedReceipt" in pb or "PaymentFailed" in pb:
+                        try:
+                            poll_json = json.loads(pb)
+                            receipt_obj = poll_json.get("data", {}).get("receipt", {})
+                            error_obj = receipt_obj.get("processingError", {})
+                            code = error_obj.get("code", "UNKNOWN")
+                            log(f"    Poll {poll_num}: FAILED -> {code}")
+                            resp, apv, chg = _classify_failed(code)
+                            ms = (time.monotonic() - t_start) * 1000
+                            return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
+                        except Exception:
+                            code = _code(pb)
+                            log(f"    Poll {poll_num}: FAILED -> {code}")
+                            resp, apv, chg = _classify_failed(code)
+                            ms = (time.monotonic() - t_start) * 1000
+                            return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
                     
                     if "ActionRequiredReceipt" in pb:
                         log(f"    Poll {poll_num}: 3DS REQUIRED")
