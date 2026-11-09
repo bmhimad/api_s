@@ -227,6 +227,36 @@ def _is_shipping_required(b):
         return sp.get("isShippingRequired", True)
     except Exception: return True
 
+# ═══ FIX: RESTORED MISSING FUNCTIONS ═══
+def _delivery_handle(b):
+    try:
+        d = json.loads(b)
+        sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
+               .get("result",{}).get("sellerProposal",{}))
+        sds = sp.get("selectedDeliveryStrategy",{})
+        if isinstance(sds, dict) and sds.get("handle"): return sds["handle"]
+        for dg in sp.get("deliveryGroups",[]):
+            for opt in dg.get("deliveryOptions",[]):
+                if isinstance(opt, dict) and opt.get("handle"): return opt["handle"]
+    except Exception: pass
+    for pat in (r'"selectedDeliveryStrategy"\s*:\s*\{[^{}]*"handle"\s*:\s*"([^"]+)"',
+                r'"__typename"\s*:\s*"CompleteDeliveryStrategy"[^{}]*"handle"\s*:\s*"([^"]+)"'):
+        m = re.search(pat, b)
+        if m: return m.group(1)
+    return ""
+
+def _signed_handles(b):
+    try:
+        d = json.loads(b)
+        sp = (d.get("data",{}).get("session",{}).get("negotiate",{})
+               .get("result",{}).get("sellerProposal",{}))
+        de = sp.get("deliveryExpectations",{})
+        if de.get("__typename") == "FilledDeliveryExpectationTerms":
+            return [x["signedHandle"] for x in de.get("deliveryExpectations",[]) if x.get("signedHandle")]
+    except Exception: pass
+    return []
+# ═══════════════════════════════════════
+
 def _payment_method_id(b):
     try:
         data = json.loads(b)
@@ -323,7 +353,7 @@ def _graphql_ids(session, shop_url, checkout_html, ua, t_rem):
         return None, None, None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🛒 PAYLOAD BUILDER (Fixed targetMerchandiseLines logic)
+# 🛒 PAYLOAD BUILDER
 # ─────────────────────────────────────────────────────────────────────────────
 def _proposal_payload(session_token, stable_id, vid, amount, currency, email, addr, proposal_id, use_lines=False, target_any=True):
     if addr:
@@ -354,7 +384,7 @@ def _proposal_payload(session_token, stable_id, vid, amount, currency, email, ad
                         },
                         "options": {},
                     },
-                    "targetMerchandiseLines": target_lines, # ═══ FIX ═══
+                    "targetMerchandiseLines": target_lines,
                     "deliveryMethodTypes":    ["NONE"],
                     "expectedTotalPrice":     {"any": True},
                     "destinationChanged":     True,
@@ -499,11 +529,11 @@ def _classify_failed(code):
     return (c or "CARD_DECLINED"), False, False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🧠 PIPELINE (Strict Flow + Detailed Logs)
+# 🧠 PIPELINE (Strict Flow)
 # ─────────────────────────────────────────────────────────────────────────────
 def _run_check(card_str, proxy_str):
     global _debug_log
-    _debug_log = []  # Reset logs for this check
+    _debug_log = [] 
     t_start = time.monotonic()
     def remain(): return BUDGET_SEC - (time.monotonic() - t_start)
     def t_max(sec): return min(sec, max(1, remain()))
