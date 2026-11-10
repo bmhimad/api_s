@@ -1045,6 +1045,8 @@ async def fetch_primary_domain(session, url, headers, proxy):
         pass
     return None
 
+
+# ── FIX 2: Merged Verify + Currency to save requests ──────────────────
 async def verify_shopify_store(session, ourl, proxy, profile):
     try:
         h = _probe_headers(profile, ourl)
@@ -1053,7 +1055,7 @@ async def verify_shopify_store(session, ourl, proxy, profile):
             try:
                 data = r.json()
                 if "shop" in data or "currency" in data:
-                    return True
+                    return True, (data.get("currency") or "USD").upper()
             except ValueError:
                 pass
         r2 = await session.get(f"{ourl}/cart.js", headers=h, proxy=proxy, timeout=8)
@@ -1061,53 +1063,12 @@ async def verify_shopify_store(session, ourl, proxy, profile):
             try:
                 data = r2.json()
                 if "items" in data and "currency" in data:
-                    return True
+                    return True, (data.get("currency") or "USD").upper()
             except ValueError:
                 pass
     except Exception:
         pass
-    return False
-
-async def detect_currency_via_meta(session, domain, proxy, profile):
-    try:
-        r = await session.get(f"{domain}/meta.json",
-                              headers=_probe_headers(profile, domain),
-                              proxy=proxy, timeout=5)
-        if r.status_code == 200:
-            c = r.json().get("currency")
-            if c: return c.upper()
-    except Exception: pass
-    return None
-
-
-async def detect_currency_via_cartjs(session, domain, proxy, profile):
-    try:
-        r = await session.get(f"{domain}/cart.js",
-                              headers=_probe_headers(profile, domain),
-                              proxy=proxy, timeout=5)
-        if r.status_code == 200:
-            c = r.json().get("currency")
-            if c: return c.upper()
-    except Exception: pass
-    return None
-
-
-async def detect_store_currency(session, domain, proxy, profile):
-    tasks = [
-        asyncio.create_task(detect_currency_via_cartjs(session, domain, proxy, profile)),
-        asyncio.create_task(detect_currency_via_meta(session, domain, proxy, profile)),
-    ]
-    try:
-        for coro in asyncio.as_completed(tasks):
-            try:
-                r = await coro
-                if isinstance(r, str) and r:
-                    for t in tasks:
-                        if not t.done(): t.cancel()
-                    return r
-            except Exception: continue
-    except Exception: pass
-    return "USD"
+    return False, "USD"
 
 
 async def probe_cart_requires_shipping(session, domain, proxy, profile):
@@ -1318,7 +1279,10 @@ async def discover_persisted_ids(session, checkout_html, checkout_origin,
     for rel in re.findall(r'src="(/[^"]+\.(?:js|mjs)[^"]*)"', checkout_html):
         js_urls.append(f"https://{checkout_origin}{rel}")
     js_urls += re.findall(r'href="(https?://[^"]+\.(?:js|mjs)[^"]*)"', checkout_html)
-    js_urls = list(dict.fromkeys(js_urls))[:30]
+    
+    # ── FIX 1: Limit JS files from 30 to 2 to save massive bandwidth ──
+    js_urls = list(dict.fromkeys(js_urls))[:2]
+    
     if not js_urls: return ids
 
     def _patterns(op):
@@ -1448,12 +1412,6 @@ async def gql(session, op_name, headers, payload, proxy,
 
 
 def _extract_amounts_from_seller(sp):
-    """
-    Extracts amount + payment method from sellerProposal.
-    PATCH: 2 extra amount fallbacks (payment.totalAmount, paymentLines[0].amount)
-    so PendingTerms / late-resolving stores still get a positive total.
-    Gateway hardcoded to "Shopify Payments".
-    """
     out = {
         "checkout_total": None, "total": None, "running": None,
         "payment_identifier": None, "payment_stable_id": None,
@@ -1472,7 +1430,6 @@ def _extract_amounts_from_seller(sp):
     try:
         pay = sp.get("payment") or {}
 
-        # ── PATCH: extra amount fallbacks ──────────────────────────────
         if not out["checkout_total"]:
             v = (pay.get("totalAmount") or {}).get("value", {}).get("amount")
             if _positive_amount(v):
@@ -1534,12 +1491,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
         async with _make_session(profile) as session:
             warm_headers = build_headers(profile, ourl, for_document=True)
             xhr_headers = build_headers(profile, ourl, for_document=False)
-            primary = await fetch_primary_domain(session, ourl, xhr_headers, proxy)
-            if primary and primary != ourl.rstrip("/"):
-                print(f"{tag} 🔀 primary domain {ourl} → {primary}")
-                ourl = primary
-                warm_headers = build_headers(profile, ourl, for_document=True)
-                xhr_headers = build_headers(profile, ourl, for_document=False)
+            
+            # ── FIX 3: Skip primary domain check if it's already a myshopify URL ──
+            if ".myshopify.com" not in ourl:
+                primary = await fetch_primary_domain(session, ourl, xhr_headers, proxy)
+                if primary and primary != ourl.rstrip("/"):
+                    print(f"{tag} 🔀 primary domain {ourl} → {primary}")
+                    ourl = primary
+                    warm_headers = build_headers(profile, ourl, for_document=True)
+                    xhr_headers = build_headers(profile, ourl, for_document=False)
 
             try:
                 await session.get(ourl, headers=warm_headers, proxy=proxy,
@@ -1549,27 +1509,21 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 print(f"[warmup] ⚠️ {str(e)[:80]}")
                 return False, "Change Proxy", gateway, variant_price_fallback, currency
 
-            is_shopify = await verify_shopify_store(session, ourl, proxy, profile)
+            # ── FIX 2: Merged Verify + Currency ──
+            is_shopify, detected_currency = await verify_shopify_store(session, ourl, proxy, profile)
             if not is_shopify:
                 print(f"[verify] ❌ Not a Shopify store (meta.json/cart.js failed)")
                 return False, "NOT_SHOPIFY", gateway, variant_price_fallback, currency
             print(f"[verify] ✅ Confirmed Shopify store")
+            currency = detected_currency
 
             if variant_id:
-                res = await asyncio.gather(detect_store_currency(session, ourl, proxy, profile),
-                                           return_exceptions=True)
-                if isinstance(res[0], str) and res[0]: currency = res[0]
                 candidate = None
                 numeric_vid = str(variant_id).split("/")[-1]
                 variant_price_fallback = "0.00"
                 print(f"[detect] ✅ {time.time()-t0:.2f}s currency={currency} candidate=provided variant={numeric_vid}")
             else:
-                res = await asyncio.gather(
-                    detect_store_currency(session, ourl, proxy, profile),
-                    fetch_cheapest_candidate(session, ourl, profile, proxy),
-                    return_exceptions=True)
-                if isinstance(res[0], str) and res[0]: currency = res[0]
-                candidate = res[1] if not isinstance(res[1], Exception) else None
+                candidate = await fetch_cheapest_candidate(session, ourl, profile, proxy)
                 print(f"[detect] ✅ {time.time()-t0:.2f}s currency={currency} candidate={'yes' if candidate else 'no'}")
                 if not candidate:
                     return False, "<b>No Purchasable Products!</b>", gateway, "0.00", currency
@@ -2153,7 +2107,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, "Change Proxy", gateway, variant_price_fallback, currency
                 return False, "Delivery parse error", gateway, variant_price_fallback, currency
 
-            # ── FIX 2: if P2 delivery failed, flip mode and retry P1+P2 ──
             if "errors" in _dj:
                 err_msg = str(_dj["errors"][0].get("message", "") or "")
                 if "DELIVERY_" in err_msg or "DELIVERY_" in resp_text:
@@ -2229,7 +2182,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             print(f"[amount] P2: checkout={checkout_total!r} total={total_amount!r}")
 
-            # ── FIX 3: handle PendingTerms / UnavailableTerms in P2 ────────
             _s2_dtype = (_s2.get("delivery") or {}).get("__typename", "")
 
             if _s2_dtype == "PendingTerms":
@@ -2961,6 +2913,7 @@ def index():
         "Time":     f"{elapsed:.2f}s",
         "Status":   success,
         "message":  clean,
+        "Detail":   str(message)[:200],
         "gateway":  "Shopify Payments",
         "price":    str(pf),
         "currency": currency or "USD",
