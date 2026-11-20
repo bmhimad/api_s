@@ -664,13 +664,15 @@ def _log_aux_signals(where, text):
 
 
 _CONNECTION_ERROR_PATTERNS = (
-    "cannot connect", "failed to connect", "proxy", "connection refused",
-    "connection reset", "connection error", "connection aborted",
-    "tunnel connection", "proxy error", "proxyerror", "sslerror",
-    "ssl error", "ssl:", "certificate", "handshake", "timed out",
-    "timeout", "time out", "name resolution", "dns", "socket",
-    "network is unreachable", "no route to host", "unreachable",
-    "curl: (", "openssl", "getaddrinfo", "eof occurred",
+    "connection refused",
+    "connection reset",
+    "connection aborted",
+    "proxy error",
+    "proxyerror",
+    "name resolution",
+    "network is unreachable",
+    "no route to host",
+    "getaddrinfo",
 )
 
 
